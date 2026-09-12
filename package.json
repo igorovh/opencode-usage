@@ -1,0 +1,25 @@
+{
+  "name": "opencode2-usage",
+  "version": "0.1.0",
+  "description": "OpenCode 2 (beta) TUI plugin: Codex / Claude / GLM usage in the sidebar and prompt footer",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check:usage": "bun scripts/check.ts"
+  },
+  "devDependencies": {
+    "@opencode/client": "beta",
+    "@opencode/plugin": "beta",
+    "@opencode/theme": "beta",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
+    "@types/bun": "latest",
+    "solid-js": "^1.9.9",
+    "typescript": "5.8.2"
+  }
+}
