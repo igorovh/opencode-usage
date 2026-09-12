@@ -32,8 +32,8 @@ const FALLBACK_USER_AGENT = "claude-code/2.1.0";
 const CLAUDE_COMMAND_TIMEOUT_MS = 4_000;
 const RATE_LIMIT_BACKOFF_BASE_MS = 30_000;
 const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000;
-/** Minimum gap between HTTP usage calls (Claude throttles aggressive polling). */
-const HTTP_MIN_INTERVAL_MS = 5 * 60_000;
+/** Minimum gap between HTTP usage calls (matches the refresh cadence). */
+const HTTP_MIN_INTERVAL_MS = 60_000;
 
 /**
  * The usage endpoint 429s when polled too aggressively; honor Retry-After and
