@@ -100,8 +100,8 @@ function remaining(window: UsageWindow): number {
 type Feedback = "success" | "warning" | "error";
 
 function feedbackFor(remainingPct: number): Feedback {
-  if (remainingPct <= 10) return "error";
-  if (remainingPct <= 30) return "warning";
+  if (remainingPct <= 20) return "error";
+  if (remainingPct <= 50) return "warning";
   return "success";
 }
 
