@@ -1,25 +1,34 @@
 /**
  * Claude Code usage.
  *
- * Strategy (mirrors opencode-quota):
+ * Strategy (mirrors opencode-quota / CodexBar):
  * 1. Probe the Claude CLI: `claude auth status --json` confirms login and the
- *    subscription tier. Newer CLI versions may include quota windows directly.
+ *    subscription tier; newer CLI versions may include quota windows directly.
  * 2. Fall back to https://api.anthropic.com/api/oauth/usage (the same endpoint
- *    the interactive `/usage` command uses) with the OAuth token from
- *    OpenCode auth.json or ~/.claude/.credentials.json.
- *
- * The usage endpoint rate-limits (HTTP 429) and sends Retry-After - we honor
- * it and back off instead of hammering.
+ *    the interactive `/usage` command uses).
+ * 3. The endpoint throttles unknown user agents - identify as the official
+ *    Claude Code client (`claude-code/<local version>`).
+ * 4. When the stored access token expires, refresh it with the refresh token
+ *    (platform.claude.com/v1/oauth/token) and persist the rotation back to
+ *    ~/.claude/.credentials.json so the Claude CLI keeps working (CodexBar-style).
+ * 5. Rate limits: honor Retry-After when present, otherwise exponential backoff
+ *    (max 15 min). While cooling down, serve the last good data, flagged.
  */
 
 import { execFile } from "node:child_process";
-import { claudeOAuthToken, opencodeAuthEntry } from "./auth";
 import { clampPct, fetchJson, HttpError } from "./http";
+import {
+  readClaudeCredsFile,
+  refreshClaudeCreds,
+  type ClaudeCreds,
+} from "./claude-creds";
+import { opencodeAuthEntry } from "./auth";
 import { errorResult, missingResult, type QuotaResult, type UsageWindow } from "./types";
 import { describe } from "./codex";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const BETA_HEADER = "oauth-2025-04-20";
+const FALLBACK_USER_AGENT = "claude-code/2.1.0";
 const CLAUDE_COMMAND_TIMEOUT_MS = 4_000;
 const RATE_LIMIT_BACKOFF_BASE_MS = 30_000;
 const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000;
@@ -60,14 +69,12 @@ let lastHttpAt = 0;
 // CLI probe
 // ---------------------------------------------------------------------------
 
-interface ClaudeCliPayload {
+interface CliProbe {
+  available: boolean; // CLI exists and ran
   loggedIn?: boolean;
-  isAuthenticated?: boolean;
-  subscriptionType?: string;
-  five_hour?: { utilization?: number; resets_at?: string };
-  seven_day?: { utilization?: number; resets_at?: string };
-  quota?: ClaudeCliPayload;
-  usage?: ClaudeCliPayload;
+  plan?: string;
+  version?: string;
+  windows?: UsageWindow[];
 }
 
 function quoteWindowsArg(value: string): string {
@@ -78,7 +85,7 @@ function claudeInvocation(args: string[]): { file: string; args: string[] } {
   const binary = process.env["CLAUDE_BIN"]?.trim() || "claude";
   if (process.platform === "win32") {
     const comspec = process.env["ComSpec"]?.trim() || "cmd.exe";
-    return { file: comspec, args: ["/d", "/s", "/c", [binary, ...args].map(quoteWindowsArg).join(" ")].map(String) };
+    return { file: comspec, args: ["/d", "/s", "/c", [binary, ...args].map(quoteWindowsArg).join(" ")] };
   }
   return { file: binary, args };
 }
@@ -99,14 +106,6 @@ function runClaude(args: string[]): Promise<{ code: number; stdout: string }> {
       },
     );
   });
-}
-
-interface CliProbe {
-  available: boolean; // CLI exists and ran
-  loggedIn?: boolean;
-  plan?: string;
-  version?: string;
-  windows?: UsageWindow[];
 }
 
 function parseWindow(
@@ -144,50 +143,123 @@ async function probeCli(): Promise<CliProbe> {
 
   const status = await runClaude(["auth", "status", "--json"]);
   const trimmed = status.stdout.trim();
-  let payload: ClaudeCliPayload | undefined;
-  try {
-    payload = JSON.parse(trimmed.startsWith("{") ? trimmed : trimmed.slice(trimmed.indexOf("{"))) as ClaudeCliPayload;
-  } catch {
-    return { available: true, loggedIn: status.code === 0 ? true : undefined };
+  let payload:
+    | {
+        loggedIn?: boolean;
+        subscriptionType?: string;
+        five_hour?: { utilization?: number; resets_at?: string };
+        seven_day?: { utilization?: number; resets_at?: string };
+      }
+    | undefined;
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start !== -1 && end > start) {
+    try {
+      payload = JSON.parse(trimmed.slice(start, end + 1));
+    } catch {
+      payload = undefined;
+    }
   }
 
-  const root = payload ?? {};
-  const source = root.quota ?? root.usage ?? root;
-  const loggedIn = typeof root.loggedIn === "boolean" ? root.loggedIn : undefined;
-
+  const loggedIn = typeof payload?.loggedIn === "boolean" ? payload.loggedIn : undefined;
   const windows: UsageWindow[] = [];
-  const fiveHour = parseWindow(source.five_hour, "5h");
-  const sevenDay = parseWindow(source.seven_day, "7d");
+  const fiveHour = parseWindow(payload?.five_hour, "5h");
+  const sevenDay = parseWindow(payload?.seven_day, "7d");
   if (fiveHour) windows.push(fiveHour);
   if (sevenDay) windows.push(sevenDay);
 
   return {
     available: true,
     loggedIn,
-    plan: planLabel(root.subscriptionType),
+    plan: planLabel(payload?.subscriptionType),
     version: versionString,
     windows: windows.length > 0 ? windows : undefined,
   };
 }
 
 // ---------------------------------------------------------------------------
-// OAuth token resolution
+// Credential resolution (file with refresh support, env, OpenCode auth.json)
 // ---------------------------------------------------------------------------
 
-async function resolveToken(): Promise<string | undefined> {
-  const envToken = await claudeOAuthToken();
-  if (envToken) return envToken;
+async function resolveCreds(): Promise<ClaudeCreds | undefined> {
+  const file = await readClaudeCredsFile();
+  if (file) return file;
+
+  const envToken = process.env["CLAUDE_CODE_OAUTH_TOKEN"]?.trim();
+  if (envToken) return { accessToken: envToken };
 
   const entry = await opencodeAuthEntry(["anthropic"]);
   const access = entry?.entry.access?.trim();
-  if (access && entry && (!entry.entry.type || entry.entry.type === "oauth")) return access;
-
+  if (access && entry && (!entry.entry.type || entry.entry.type === "oauth")) {
+    return { accessToken: access };
+  }
   return undefined;
 }
 
+// Refresh gating: terminal failures (invalid_grant) block until the stored
+// refresh token changes; transient failures back off for a few minutes.
+let refreshBlockedUntil = 0;
+let lastFailedRefreshToken = "";
+
+async function ensureFreshToken(creds: ClaudeCreds): Promise<string> {
+  const expired =
+    !!creds.filePath &&
+    !!creds.refreshToken &&
+    !!creds.expiresAt &&
+    creds.expiresAt - 5 * 60_000 < Date.now();
+  if (
+    !expired ||
+    Date.now() < refreshBlockedUntil ||
+    creds.refreshToken === lastFailedRefreshToken
+  ) {
+    return creds.accessToken;
+  }
+
+  const outcome = await refreshClaudeCreds(creds);
+  if (outcome && !outcome.retryAfterMs) {
+    return outcome.creds.accessToken;
+  }
+  if (outcome?.terminal && creds.refreshToken) {
+    lastFailedRefreshToken = creds.refreshToken;
+  }
+  refreshBlockedUntil =
+    Date.now() +
+    (outcome?.retryAfterMs && Number.isFinite(outcome.retryAfterMs)
+      ? outcome.retryAfterMs
+      : 5 * 60_000);
+  return creds.accessToken;
+}
+
 // ---------------------------------------------------------------------------
-// Public API
+// Usage fetch
 // ---------------------------------------------------------------------------
+
+interface AnthropicUsageResponse {
+  five_hour?: { utilization?: number; resets_at?: string };
+  seven_day?: { utilization?: number; resets_at?: string };
+}
+
+function parseWindows(data: AnthropicUsageResponse): UsageWindow[] {
+  const windows: UsageWindow[] = [];
+  const fiveHour = parseWindow(data.five_hour, "5h");
+  const sevenDay = parseWindow(data.seven_day, "7d");
+  if (fiveHour) windows.push(fiveHour);
+  if (sevenDay) windows.push(sevenDay);
+  return windows;
+}
+
+async function fetchUsage(token: string, userAgent: string): Promise<UsageWindow[]> {
+  const data = await fetchJson<AnthropicUsageResponse>(USAGE_URL, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      "anthropic-beta": BETA_HEADER,
+      "user-agent": userAgent,
+    },
+  });
+  const windows = parseWindows(data);
+  if (windows.length === 0) throw new Error("No quota windows in Claude usage response.");
+  return windows;
+}
 
 export async function queryClaude(): Promise<QuotaResult> {
   const cli = await probeCli();
@@ -196,15 +268,10 @@ export async function queryClaude(): Promise<QuotaResult> {
   }
   // Anthropic throttles this endpoint for unknown user agents - identify as
   // the official Claude Code client (same trick as CodexBar).
-  const userAgent = `claude-code/${cli.version ?? "2.1.0"}`;
+  const userAgent = `claude-code/${cli.version ?? FALLBACK_USER_AGENT}`;
 
-  const cliPlan = cli.plan;
-  if (cli.windows && cli.windows.length > 0) {
-    return { ok: true, plan: cliPlan, windows: cli.windows };
-  }
-
-  const token = await resolveToken();
-  if (!token) {
+  const creds = await resolveCreds();
+  if (!creds) {
     if (cli.available && cli.loggedIn) {
       return missingResult("Claude CLI is authenticated but no OAuth token is exposed for usage queries.");
     }
@@ -236,29 +303,46 @@ export async function queryClaude(): Promise<QuotaResult> {
     };
   }
 
+  let token = await ensureFreshToken(creds);
   try {
     lastHttpAt = Date.now();
-    const data = await fetchJson<{ five_hour?: { utilization?: number; resets_at?: string }; seven_day?: { utilization?: number; resets_at?: string } }>(
-      USAGE_URL,
-      {
-        headers: {
-          authorization: `Bearer ${token}`,
-          "anthropic-beta": BETA_HEADER,
-          "user-agent": userAgent,
-        },
-      },
-    );
+    const windows = await fetchUsage(token, userAgent);
     rateLimitFailures = 0;
     rateLimitedUntil = 0;
-    const windows: UsageWindow[] = [];
-    const fiveHour = parseWindow(data.five_hour, "5h");
-    const sevenDay = parseWindow(data.seven_day, "7d");
-    if (fiveHour) windows.push(fiveHour);
-    if (sevenDay) windows.push(sevenDay);
-    if (windows.length === 0) return errorResult("No quota windows in Claude usage response.");
-    lastGood = { plan: cliPlan, windows };
-    return { ok: true, plan: cliPlan, windows };
+    lastGood = { plan: cli.plan, windows };
+    return { ok: true, plan: cli.plan, windows };
   } catch (error) {
+    // Access token expired: refresh once and retry.
+    if (
+      error instanceof HttpError &&
+      error.status === 401 &&
+      creds.refreshToken &&
+      creds.refreshToken !== lastFailedRefreshToken &&
+      Date.now() > refreshBlockedUntil
+    ) {
+      const outcome = await refreshClaudeCreds(creds);
+      if (outcome && !outcome.retryAfterMs) {
+        token = outcome.creds.accessToken;
+        try {
+          lastHttpAt = Date.now();
+          const windows = await fetchUsage(token, userAgent);
+          rateLimitFailures = 0;
+          rateLimitedUntil = 0;
+          lastGood = { plan: cli.plan, windows };
+          return { ok: true, plan: cli.plan, windows };
+        } catch (retryError) {
+          error = retryError;
+        }
+      } else if (outcome?.terminal && creds.refreshToken) {
+        lastFailedRefreshToken = creds.refreshToken;
+      }
+      if (outcome?.retryAfterMs) {
+        refreshBlockedUntil =
+          Date.now() +
+          (Number.isFinite(outcome.retryAfterMs) ? outcome.retryAfterMs : 5 * 60_000);
+      }
+    }
+
     if (error instanceof HttpError && error.status === 429) {
       const waitMs = noteRateLimited(error.retryAfterMs);
       const source = error.retryAfterMs && error.retryAfterMs > 0 ? "server" : "backoff";
@@ -270,6 +354,9 @@ export async function queryClaude(): Promise<QuotaResult> {
         message: `Claude: rate limited, retry in ${wait} (${source}).`,
         limitedUntil: rateLimitedUntil,
       };
+    }
+    if (error instanceof HttpError && error.status === 401) {
+      return errorResult("Claude: unauthorized - token expired, re-authenticate.");
     }
     return errorResult(describe(error, "Claude"));
   }
