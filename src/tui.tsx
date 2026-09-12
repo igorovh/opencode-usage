@@ -140,15 +140,6 @@ function limitedCountdown(snapshot: ProviderSnapshot): string | undefined {
   return ms >= 90_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`;
 }
 
-/** Short time until the next HTTP poll when serving throttled-cache data. */
-function cachedCountdown(snapshot: ProviderSnapshot): string | undefined {
-  const until = snapshot.cacheUntil;
-  if (!until) return undefined;
-  const ms = until - Date.now();
-  if (ms <= 0) return undefined;
-  return ms >= 90_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`;
-}
-
 /** Critical window = least remaining, e.g. "0% 4h 7m". */
 function summary(snapshot: ProviderSnapshot): string {  const windows = windowsOf(snapshot);
   if (windows.length === 0) return "";
@@ -303,12 +294,7 @@ function SidebarCard(props: { ctx: TuiContext; state: UsageState }) {
                     </text>
                     <Show when={index() === 0 && limitedCountdown(snap())}>
                       <text fg={ctx.theme.text.subdued} wrapMode="none">
-                        {` (limited ${limitedCountdown(snap())})`}
-                      </text>
-                    </Show>
-                    <Show when={index() === 0 && !limitedCountdown(snap()) && cachedCountdown(snap())}>
-                      <text fg={ctx.theme.text.subdued} wrapMode="none">
-                        {` ⟳ ${cachedCountdown(snap())}`}
+                        {` ⟳ ${limitedCountdown(snap())}`}
                       </text>
                     </Show>
                   </box>
