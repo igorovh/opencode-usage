@@ -69,6 +69,11 @@ const MIN_REFRESH_MS = 15_000;
 /** How long the last successful usage stays displayed when a refresh errors. */
 const STALE_OK_MS = 10 * 60_000;
 
+// Claude fetch cadence (api.anthropic.com 429s under aggressive polling):
+// a turn resets the ramp to the base, idle time doubles it up to the max.
+const CLAUDE_BASE_INTERVAL_MS = 2 * 60_000;
+const CLAUDE_MAX_INTERVAL_MS = 15 * 60_000;
+
 // ---------------------------------------------------------------------------
 // Provider registry + shared state
 // ---------------------------------------------------------------------------
@@ -187,7 +192,7 @@ function summary(snapshot: ProviderSnapshot): string {
 /** Mounts the /usage command. Keymap layers must be created inside a rendered component. */
 function UsageCommands(props: {
   ctx: TuiContext;
-  refresh: () => Promise<void>;
+  refresh: (opts?: { force?: boolean }) => Promise<void>;
   nextRefresh: () => number;
   state: UsageState;
 }) {
@@ -202,7 +207,7 @@ function UsageCommands(props: {
         slash: { name: "usage" },
         suggested: true,
         run: async () => {
-          await props.refresh();
+          await props.refresh({ force: true });
           const lines = PROVIDER_IDS.filter((id) => snapOf(props.state, id).state.status === "ok")
             .flatMap((id) => {
               const snap = snapOf(props.state, id);
@@ -450,13 +455,40 @@ export default Plugin.define({
 
     let inFlight = false;
     let nextRefreshAt = 0;
-    const refresh = async (): Promise<void> => {
+    let claudeRampMs = CLAUDE_BASE_INTERVAL_MS;
+    const refresh = async (opts?: { force?: boolean }): Promise<void> => {
       if (inFlight) return;
       inFlight = true;
       try {
         nextRefreshAt = Date.now() + refreshMs;
         await Promise.all(
           PROVIDER_IDS.filter(enabled).map(async (id) => {
+            const before = snapOf(state, id);
+            const now0 = Date.now();
+            // Shared rate-limit cooldown (persisted, syncs across TUI
+            // instances): do not call the API at all.
+            if (before.limitedUntil && before.limitedUntil > now0) {
+              void writeUsageLog({
+                event: "skip",
+                instance: instanceId,
+                provider: id,
+                reason: "limited",
+                limitedUntil: before.limitedUntil,
+              });
+              return;
+            }
+            // Claude: the timer tick is a no-op while the persisted cache
+            // window (idle ramp, 2..15 min) is fresh; turns and /usage force.
+            if (id === "claude" && !opts?.force && (before.cacheUntil ?? 0) > now0) {
+              void writeUsageLog({
+                event: "skip",
+                instance: instanceId,
+                provider: id,
+                reason: "cached",
+                cacheUntil: before.cacheUntil,
+              });
+              return;
+            }
             const t0 = Date.now();
             const result = await PROVIDERS[id]!.query(options);
             const ms = Date.now() - t0;
@@ -497,12 +529,24 @@ export default Plugin.define({
                   return;
                 }
               }
+              // cacheUntil drives the next allowed fetch: the source's own
+              // window when it served cache, otherwise the idle ramp (fresh
+              // HTTP call only). A rate-limit cooldown supersedes it.
+              let cacheUntil: number | undefined;
+              if (result.ok && !result.limitedUntil) {
+                if (result.cacheUntil !== undefined) {
+                  cacheUntil = result.cacheUntil;
+                } else if (id === "claude") {
+                  cacheUntil = Date.now() + claudeRampMs;
+                  claudeRampMs = Math.min(CLAUDE_MAX_INTERVAL_MS, claudeRampMs * 2);
+                }
+              }
               draft.providers[id] = {
                 id,
                 label: PROVIDERS[id]!.label,
                 updatedAt: now,
                 limitedUntil: result.ok ? result.limitedUntil : undefined,
-                cacheUntil: result.ok ? result.cacheUntil : undefined,
+                cacheUntil,
                 state: result.ok
                   ? {
                       status: "ok",
@@ -527,12 +571,14 @@ export default Plugin.define({
       const now = Date.now();
       if (now - lastExecutionRefresh < 10_000) return;
       lastExecutionRefresh = now;
+      // A turn may have consumed quota: schedule the next Claude fetch soon.
+      claudeRampMs = CLAUDE_BASE_INTERVAL_MS;
       void refresh();
     });
 
     const timer = setInterval(() => void refresh(), refreshMs);
     // De-synchronize instances so they don't all fire in the same second.
-    const initialTimer = setTimeout(() => void refresh(), Math.random() * 3_000);
+    const initialTimer = setTimeout(() => void refresh({ force: true }), Math.random() * 3_000);
 
     const unregisterSlots: (() => void)[] = [];
 
