@@ -29,3 +29,21 @@ export function formatDuration(ms: number): string {
 export function worstUsedPct(windows: readonly UsageWindow[]): number {
   return windows.reduce((worst, window) => Math.max(worst, window.usedPct), 0);
 }
+
+function truncate(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+/** Short, human status for a provider/account error message. */
+export function shortStatus(message: string | undefined): string {
+  if (!message) return "not connected";
+  if (/HTTP 429|rate limit/i.test(message)) {
+    const wait = message.match(/retry in (\d+[ms])/i)?.[1];
+    return wait ? `rate limited (${wait})` : "rate limited";
+  }
+  if (/HTTP 40[13]|unauthorized|expired/i.test(message)) return "login required";
+  if (/no subscription|entitlement|HTTP 403/i.test(message)) return "no subscription";
+  if (/timed out|timeout/i.test(message)) return "timeout";
+  if (/No .* token|connect|env/i.test(message)) return "not connected";
+  return truncate(message, 24);
+}
