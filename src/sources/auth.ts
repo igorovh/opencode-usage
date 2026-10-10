@@ -1,15 +1,16 @@
 /**
- * Credential discovery for the three providers.
+ * Credential discovery for the providers.
  *
  * - OpenCode auth.json stores OAuth/API keys created via `/connect` (provider ids
  *   like "openai", "anthropic", "zai-coding-plan", ...).
- * - Claude Code stores its own OAuth token in ~/.claude/.credentials.json.
+ * - Claude accounts (multi-account) live in OpenCode's sqlite credential store.
  * - Codex CLI stores OAuth tokens in ~/.codex/auth.json.
  *
  * Only token *values* are returned; callers must not log them.
  */
 
 import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -45,6 +46,9 @@ function opencodeDataDirs(): string[] {
   const xdgData = process.env["XDG_DATA_HOME"]?.trim();
   if (xdgData) dirs.push(xdgData);
   dirs.push(join(home, ".local", "share", "opencode"));
+  if (process.platform === "darwin") {
+    dirs.push(join(home, "Library", "Application Support", "opencode"));
+  }
   if (process.platform === "win32" && process.env["LOCALAPPDATA"]) {
     dirs.push(join(process.env["LOCALAPPDATA"], "opencode"));
   }
@@ -55,6 +59,20 @@ export async function readOpencodeAuth(): Promise<Json | null> {
   const now = Date.now();
   if (opencodeAuthCache && now - opencodeAuthCache.at < CACHE_TTL_MS) {
     return opencodeAuthCache.value;
+  }
+  // Explicit file override (used by opencode itself).
+  const explicit = process.env["OPENCODE_AUTH_JSON"]?.trim();
+  if (explicit) {
+    try {
+      const content = await readFile(explicit, "utf8");
+      const parsed = asRecord(JSON.parse(content));
+      if (parsed) {
+        opencodeAuthCache = { at: now, value: parsed };
+        return parsed;
+      }
+    } catch {
+      // fall through to the standard locations
+    }
   }
   let value: Json | null = null;
   for (const dir of opencodeDataDirs()) {
@@ -76,6 +94,7 @@ export async function readOpencodeAuth(): Promise<Json | null> {
 export interface OpencodeAuthEntry {
   type?: string;
   key?: string;
+  apiKey?: string;
   access?: string;
   refresh?: string;
   expires?: number;
@@ -96,22 +115,100 @@ export async function opencodeAuthEntry(
 }
 
 // ---------------------------------------------------------------------------
-// Claude Code credentials
+// OpenCode credential store (sqlite)
 // ---------------------------------------------------------------------------
 
-export async function claudeOAuthToken(): Promise<string | undefined> {
-  const envToken = process.env["CLAUDE_CODE_OAUTH_TOKEN"]?.trim();
-  if (envToken) return envToken;
+/** One Claude account from the OpenCode credential store. */
+export interface OpencodeClaudeAccount {
+  /** Credential row id - stable key for per-account caches. */
+  id: string;
+  /** Account email parsed from the credential label, when present. */
+  email?: string;
+  accessToken: string;
+  refreshToken?: string;
+  /** Epoch ms; the auth plugin rotates tokens behind this store. */
+  expires?: number;
+  /** OpenCode marks this account as the one used for new sessions. */
+  active: boolean;
+}
 
-  const configDir = process.env["CLAUDE_CONFIG_DIR"]?.trim() || join(homedir(), ".claude");
-  try {
-    const content = await readFile(join(configDir, ".credentials.json"), "utf8");
-    const parsed = asRecord(JSON.parse(content));
-    const oauth = asRecord(parsed?.["claudeAiOauth"]) ?? asRecord(parsed?.["oauth"]) ?? parsed;
-    return firstString(oauth, ["accessToken", "access_token", "token"]);
-  } catch {
-    return undefined;
+let claudeAccountsCache: { at: number; value: OpencodeClaudeAccount[] } | undefined;
+
+function opencodeDbPaths(): string[] {
+  const paths: string[] = [];
+  for (const dir of opencodeDataDirs()) {
+    paths.push(join(dir, "opencode.db"), join(dir, "opencode-next.db"));
   }
+  return [...new Set(paths)];
+}
+
+function emailFromLabel(label: unknown): string | undefined {
+  if (typeof label !== "string") return undefined;
+  return label.match(/[\w.+-]+@[\w.-]+\.\w+/)?.[0];
+}
+
+/**
+ * Claude accounts (integration id "anthropic") stored by OpenCode's /connect
+ * and kept fresh by the OAuth auth plugin. Read-only: token rotation stays
+ * with the auth plugin, this only snapshots what is on disk.
+ */
+export async function readOpencodeClaudeAccounts(force = false): Promise<OpencodeClaudeAccount[]> {
+  const now = Date.now();
+  if (!force && claudeAccountsCache && now - claudeAccountsCache.at < CACHE_TTL_MS) {
+    return claudeAccountsCache.value;
+  }
+  const accounts: OpencodeClaudeAccount[] = [];
+  try {
+    const { Database } = await import("bun:sqlite");
+    for (const path of opencodeDbPaths()) {
+      if (!existsSync(path)) continue;
+      // Read-only + WAL lets this run alongside the TUI that owns the store.
+      let db: { query(sql: string): { all(...params: unknown[]): unknown[] } ; close(): void };
+      try {
+        db = new Database(path, { readonly: true });
+      } catch {
+        continue;
+      }
+      try {
+        const rows = db
+          .query("select id, label, value, active from credential where integration_id = ?")
+          .all("anthropic") as Array<{
+          id: string;
+          label: string | null;
+          value: string;
+          active: number | null;
+        }>;
+        for (const row of rows) {
+          try {
+            const parsed = asRecord(JSON.parse(row.value));
+            const access = firstString(parsed, ["access", "accessToken"]);
+            if (!access) continue;
+            accounts.push({
+              id: row.id,
+              email: emailFromLabel(row.label),
+              accessToken: access,
+              refreshToken: firstString(parsed, ["refresh", "refreshToken"]),
+              expires: typeof parsed?.expires === "number" ? parsed.expires : undefined,
+              active: row.active === 1,
+            });
+          } catch {
+            // skip malformed credential row
+          }
+        }
+      } finally {
+        db.close();
+      }
+    }
+  } catch {
+    // bun:sqlite unavailable - treat as no accounts
+  }
+  const seen = new Set<string>();
+  const unique = accounts.filter((account) =>
+    seen.has(account.id) ? false : (seen.add(account.id), true),
+  );
+  unique.sort((a, b) => Number(b.active) - Number(a.active) || a.id.localeCompare(b.id));
+  claudeAccountsCache = { at: now, value: unique };
+  return unique;
 }
 
 // ---------------------------------------------------------------------------

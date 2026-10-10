@@ -1,7 +1,7 @@
 /**
  * usage - OpenCode 2 (beta) TUI plugin.
  *
- * Shows Codex / Claude / GLM Coding Plan usage:
+ * Shows Codex / Claude / GLM Coding Plan / OpenCode Go usage:
  * - a card in the session sidebar (slot "sidebar.content")
  * - a compact one-liner in the prompt footer status (slot "prompt.footer.status")
  * - a one-liner on the home screen (slot "home.footer")
@@ -13,15 +13,33 @@
 /** @jsxImportSource @opentui/solid */
 
 import { Plugin, usePlugin } from "@opencode/plugin/tui";
+import type { RGBA } from "@opentui/core";
 import { For, Show } from "solid-js";
-import { formatReset, renderBar } from "./format";
+import { formatReset, renderBar, shortStatus } from "./format";
 import { writeUsageLog } from "./sources/log";
 import { queryClaude } from "./sources/claude";
 import { queryCodex } from "./sources/codex";
 import { queryGlm } from "./sources/glm";
-import type { ProviderId, ProviderSnapshot, UsageWindow } from "./sources/types";
+import { queryOpencodeGo } from "./sources/opencode-go";
+import type {
+  ClaudeAccountUsage,
+  ProviderId,
+  ProviderSnapshot,
+  UsageWindow,
+} from "./sources/types";
 
 type TuiContext = ReturnType<typeof usePlugin>;
+
+// Published SDK types lag host 2.0.x: text.default/subdued became base/muted, feedback .default became .base.
+type UsageTheme = {
+  readonly text: {
+    readonly base: RGBA
+    readonly muted: RGBA
+    readonly feedback: Readonly<Record<"success" | "warning" | "error", { readonly base: RGBA }>>
+  }
+}
+
+const themeOf = (ctx: TuiContext): UsageTheme => ctx.theme as unknown as UsageTheme
 
 // ---------------------------------------------------------------------------
 // Options
@@ -38,6 +56,12 @@ interface UsageOptions {
   home?: boolean;
   /** Enable/disable individual providers. Default: all enabled. */
   providers?: Partial<Record<ProviderId, boolean>>;
+  /** OpenCode Go API key override (default: OPENCODE_API_KEY env, then auth.json). */
+  goApiKey?: string;
+  /** Alias for goApiKey (matches the standalone Go usage plugin). */
+  apiKey?: string;
+  /** OpenCode Go API base override (default: https://opencode.ai/zen/go). */
+  goBaseUrl?: string;
 }
 
 const DEFAULT_REFRESH_MS = 60_000;
@@ -49,10 +73,14 @@ const STALE_OK_MS = 10 * 60_000;
 // Provider registry + shared state
 // ---------------------------------------------------------------------------
 
-const PROVIDERS: Record<ProviderId, { label: string; query: () => Promise<QueryOutcome> }> = {
+const PROVIDERS: Record<ProviderId, { label: string; query: (opts?: UsageOptions) => Promise<QueryOutcome> }> = {
   codex: { label: "Codex", query: () => queryCodex() },
   claude: { label: "Claude", query: () => queryClaude() },
   glm: { label: "GLM", query: () => queryGlm() },
+  "opencode-go": {
+    label: "Go",
+    query: (opts) => queryOpencodeGo({ apiKey: opts?.goApiKey ?? opts?.apiKey, baseUrl: opts?.goBaseUrl }),
+  },
 };
 
 const PROVIDER_IDS = Object.keys(PROVIDERS) as ProviderId[];
@@ -77,15 +105,22 @@ function initialState(): UsageState {
       codex: initialSnapshot("codex"),
       claude: initialSnapshot("claude"),
       glm: initialSnapshot("glm"),
+      "opencode-go": initialSnapshot("opencode-go"),
     },
   };
+}
+
+/** Defensive read: durable storage may predate a provider (e.g. "opencode-go"
+ * added in a later version), so a key can be absent - fall back to fresh. */
+export function snapOf(state: UsageState, id: ProviderId): ProviderSnapshot {
+  return state.providers[id] ?? initialSnapshot(id);
 }
 
 // ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
-const WINDOW_ORDER: Record<string, number> = { "5h": 0, "7d": 1, "30d": 2 };
+const WINDOW_ORDER: Record<string, number> = { "5h": 0, "7d": 1, "30d": 2, "1m": 2 };
 
 /** 5h first, then 7d/30d, anything else last. */
 function sortedWindows(windows: readonly UsageWindow[]): UsageWindow[] {
@@ -105,30 +140,22 @@ function feedbackFor(remainingPct: number): Feedback {
   return "success";
 }
 
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-}
-
 function windowsOf(snapshot: ProviderSnapshot): readonly UsageWindow[] {
   return snapshot.state.status === "ok" ? snapshot.state.windows : [];
 }
 
+function accountsOf(snapshot: ProviderSnapshot): readonly ClaudeAccountUsage[] {
+  return snapshot.state.status === "ok" ? (snapshot.state.accounts ?? []) : [];
+}
+
 function feedbackColor(ctx: TuiContext, window: UsageWindow) {
-  return ctx.theme.text.feedback[feedbackFor(remaining(window))].default;
+  return themeOf(ctx).text.feedback[feedbackFor(remaining(window))].base;
 }
 
 /** "not connected" or a short, human error label. */
 function missingText(snapshot: ProviderSnapshot): string {
   if (snapshot.state.status !== "error") return "not connected";
-  const message = snapshot.state.message;
-  if (/HTTP 429|rate limit/i.test(message)) {
-    const wait = message.match(/retry in (\d+[ms])/i)?.[1];
-    return wait ? `rate limited (${wait})` : "rate limited";
-  }
-  if (/HTTP 40[13]|unauthorized|expired/i.test(message)) return "login required";
-  if (/timed out|timeout/i.test(message)) return "timeout";
-  if (/No .* token|connect|env/i.test(message)) return "not connected";
-  return truncate(message, 24);
+  return shortStatus(snapshot.state.message);
 }
 
 /** Short time until the next allowed attempt, e.g. "3m" or "45s"; undefined when not limited. */
@@ -141,12 +168,16 @@ function limitedCountdown(snapshot: ProviderSnapshot): string | undefined {
 }
 
 /** Critical window = least remaining, e.g. "0% 4h 7m". */
-function summary(snapshot: ProviderSnapshot): string {  const windows = windowsOf(snapshot);
+function windowsSummary(windows: readonly UsageWindow[]): string {
   if (windows.length === 0) return "";
   const critical = windows.reduce((a, b) => (remaining(a) <= remaining(b) ? a : b));
   const pct = `${Math.round(remaining(critical))}%`;
   const reset = formatReset(critical.resetsAt);
   return reset ? `${pct} ${reset}` : pct;
+}
+
+function summary(snapshot: ProviderSnapshot): string {
+  return windowsSummary(windowsOf(snapshot));
 }
 
 // ---------------------------------------------------------------------------
@@ -172,19 +203,26 @@ function UsageCommands(props: {
         suggested: true,
         run: async () => {
           await props.refresh();
-          const lines = PROVIDER_IDS.filter((id) => props.state.providers[id]!.state.status === "ok").map(
-            (id) => {
-              const snap = props.state.providers[id]!;
-              let line = `${snap.label} ${summary(snap)}`;
+          const lines = PROVIDER_IDS.filter((id) => snapOf(props.state, id).state.status === "ok")
+            .flatMap((id) => {
+              const snap = snapOf(props.state, id);
               const limited = limitedCountdown(snap);
-              if (limited) {
-                line += ` (limited ${limited})`;
-              } else if (snap.id === "claude" && props.nextRefresh() > Date.now()) {
-                line += ` (refresh in ${Math.max(1, Math.round((props.nextRefresh() - Date.now()) / 1000))}s)`;
+              const suffix = limited
+                ? ` (limited ${limited})`
+                : snap.id === "claude" && props.nextRefresh() > Date.now()
+                  ? ` (refresh in ${Math.max(1, Math.round((props.nextRefresh() - Date.now()) / 1000))}s)`
+                  : "";
+              // Claude: one line per connected account.
+              const accounts = accountsOf(snap);
+              if (snap.id === "claude" && accounts.length > 0) {
+                return accounts.map((account) =>
+                  account.windows.length > 0
+                    ? `${snap.label} ${account.label} ${windowsSummary(account.windows)}`
+                    : `${snap.label} ${account.label}: ${shortStatus(account.message)}`,
+                );
               }
-              return line;
-            },
-          );
+              return [`${snap.label} ${summary(snap)}${suffix}`];
+            });
           props.ctx.ui.toast.show({
             title: "Usage",
             message: lines.length > 0 ? lines.join("\n") : "No usage data available",
@@ -206,17 +244,17 @@ function fiveHour(snapshot: ProviderSnapshot): UsageWindow | undefined {
 }
 
 function StatusLine(props: { ctx: TuiContext; state: UsageState }) {
-  const ctx = props.ctx;
+  const theme = themeOf(props.ctx);
   const visible = () =>
     PROVIDER_IDS.filter((id) => {
-      const snap = props.state.providers[id]!;
+      const snap = snapOf(props.state, id);
       return snap.state.status === "ok" && fiveHour(snap) !== undefined;
     });
   return (
     <Show
       when={visible().length > 0}
       fallback={
-        <text fg={ctx.theme.text.subdued} wrapMode="none">
+        <text fg={theme.text.muted} wrapMode="none">
           usage: no data
         </text>
       }
@@ -224,19 +262,19 @@ function StatusLine(props: { ctx: TuiContext; state: UsageState }) {
       <box flexDirection="row" gap={0}>
         <For each={visible()}>
           {(id, index) => {
-            const snap = () => props.state.providers[id]!;
+            const snap = () => snapOf(props.state, id);
             const window = () => fiveHour(snap())!;
             return (
               <>
                 <Show when={index() > 0}>
-                  <text fg={ctx.theme.text.subdued} wrapMode="none">
+                  <text fg={theme.text.muted} wrapMode="none">
                     {" / "}
                   </text>
                 </Show>
-                <text fg={ctx.theme.text.default} wrapMode="none">
+                <text fg={theme.text.base} wrapMode="none">
                   {snap().label}
                 </text>
-                <text fg={ctx.theme.text.subdued} wrapMode="none">
+                <text fg={theme.text.muted} wrapMode="none">
                   {` ${Math.round(remaining(window()))}%`}
                 </text>
               </>
@@ -248,59 +286,132 @@ function StatusLine(props: { ctx: TuiContext; state: UsageState }) {
   );
 }
 
+/** One usage window row: `<label> <window> <bar> <pct> <reset> [⟳ cooldown]`. */
+function WindowRow(props: {
+  ctx: TuiContext;
+  label: string;
+  window: UsageWindow;
+  showLimited?: string | undefined;
+}) {
+  const theme = themeOf(props.ctx);
+  return (
+    <box flexDirection="row" gap={0}>
+      <text fg={theme.text.base} wrapMode="none">
+        {props.label}
+      </text>
+      <text fg={theme.text.muted} wrapMode="none">
+        {` ${props.window.label} `}
+      </text>
+      <text fg={feedbackColor(props.ctx, props.window)} wrapMode="none">
+        {renderBar(remaining(props.window), 12)}
+      </text>
+      <text fg={theme.text.muted} wrapMode="none">
+        {` ${Math.round(remaining(props.window))}% ${formatReset(props.window.resetsAt)}`}
+      </text>
+      <Show when={props.showLimited}>
+        <text fg={theme.text.muted} wrapMode="none">
+          {` ⟳ ${props.showLimited}`}
+        </text>
+      </Show>
+    </box>
+  );
+}
+
+function ProviderWindowRows(props: { ctx: TuiContext; snapshot: ProviderSnapshot }) {
+  return (
+    <For each={sortedWindows(windowsOf(props.snapshot))}>
+      {(window, index) => (
+        <WindowRow
+          ctx={props.ctx}
+          label={index() === 0 ? props.snapshot.label.padEnd(LABEL_WIDTH) : " ".repeat(LABEL_WIDTH)}
+          window={window}
+          showLimited={index() === 0 ? limitedCountdown(props.snapshot) : undefined}
+        />
+      )}
+    </For>
+  );
+}
+
+/** Per-account rows for Claude: windows per account, masked email underneath. */
+function ClaudeAccountRows(props: { ctx: TuiContext; snapshot: ProviderSnapshot }) {
+  const theme = themeOf(props.ctx);
+  return (
+    <For each={accountsOf(props.snapshot)}>
+      {(account, accountIndex) => (
+        <>
+          <Show when={accountIndex() > 0}>
+            <text wrapMode="none">{" "}</text>
+          </Show>
+          <Show
+            when={account.windows.length > 0}
+            fallback={
+              <text fg={theme.text.muted} wrapMode="none">
+                {`${" ".repeat(LABEL_WIDTH)} ${shortStatus(account.message)}`}
+              </text>
+            }
+          >
+            <For each={sortedWindows(account.windows)}>
+              {(window, index) => (
+                <WindowRow
+                  ctx={props.ctx}
+                  label={
+                    accountIndex() === 0 && index() === 0
+                      ? props.snapshot.label.padEnd(LABEL_WIDTH)
+                      : " ".repeat(LABEL_WIDTH)
+                  }
+                  window={window}
+                  showLimited={
+                    accountIndex() === 0 && index() === 0
+                      ? limitedCountdown(props.snapshot)
+                      : undefined
+                  }
+                />
+              )}
+            </For>
+          </Show>
+          <text fg={theme.text.muted} wrapMode="none">
+            {`${" ".repeat(LABEL_WIDTH + 4)}${account.label}`}
+          </text>
+        </>
+      )}
+    </For>
+  );
+}
+
 function SidebarCard(props: { ctx: TuiContext; state: UsageState }) {
   const ctx = props.ctx;
+  const theme = themeOf(ctx);
   return (
     <box flexDirection="column" marginTop={1}>
-      <text fg={ctx.theme.text.subdued} wrapMode="none">
+      <text fg={theme.text.muted} wrapMode="none">
         Usage
       </text>
       <text wrapMode="none">{" "}</text>
       <For each={PROVIDER_IDS}>
         {(id, index) => {
-          const snap = () => props.state.providers[id]!;
+          const snap = () => snapOf(props.state, id);
           return (
             <>
               <Show when={index() > 0}>
-                <text fg={ctx.theme.text.subdued} wrapMode="none">
+                <text fg={theme.text.muted} wrapMode="none">
                   {" "}
                 </text>
               </Show>
               <Show
                 when={snap().state.status === "ok"}
                 fallback={
-                  <text fg={ctx.theme.text.subdued} wrapMode="none">
+                  <text fg={theme.text.muted} wrapMode="none">
                     {`${snap().label.padEnd(LABEL_WIDTH)} ${missingText(snap())}`}
                   </text>
                 }
               >
-              <For each={sortedWindows(windowsOf(snap()))}>
-                {(window, index) => (
-                  <box flexDirection="row" gap={0}>
-                    <text
-                      fg={index() === 0 ? ctx.theme.text.default : ctx.theme.text.subdued}
-                      wrapMode="none"
-                    >
-                      {index() === 0 ? snap().label.padEnd(LABEL_WIDTH) : " ".repeat(LABEL_WIDTH)}
-                    </text>
-                    <text fg={ctx.theme.text.subdued} wrapMode="none">
-                      {` ${window.label} `}
-                    </text>
-                    <text fg={feedbackColor(ctx, window)} wrapMode="none">
-                      {renderBar(remaining(window), 12)}
-                    </text>
-                    <text fg={ctx.theme.text.subdued} wrapMode="none">
-                      {` ${Math.round(remaining(window))}% ${formatReset(window.resetsAt)}`}
-                    </text>
-                    <Show when={index() === 0 && limitedCountdown(snap())}>
-                      <text fg={ctx.theme.text.subdued} wrapMode="none">
-                        {` ⟳ ${limitedCountdown(snap())}`}
-                      </text>
-                    </Show>
-                  </box>
-                )}
-              </For>
-            </Show>
+                <Show
+                  when={accountsOf(snap()).length > 0}
+                  fallback={<ProviderWindowRows ctx={ctx} snapshot={snap()} />}
+                >
+                  <ClaudeAccountRows ctx={ctx} snapshot={snap()} />
+                </Show>
+              </Show>
             </>
           );
         }}
@@ -329,6 +440,14 @@ export default Plugin.define({
       initial: initialState(),
     });
 
+    // Backfill keys missing from state persisted by older versions (e.g. a
+    // provider added later) so every render path sees a complete record.
+    mutate((draft: UsageState) => {
+      for (const id of PROVIDER_IDS) {
+        draft.providers[id] ??= initialSnapshot(id);
+      }
+    });
+
     let inFlight = false;
     let nextRefreshAt = 0;
     const refresh = async (): Promise<void> => {
@@ -339,7 +458,7 @@ export default Plugin.define({
         await Promise.all(
           PROVIDER_IDS.filter(enabled).map(async (id) => {
             const t0 = Date.now();
-            const result = await PROVIDERS[id]!.query();
+            const result = await PROVIDERS[id]!.query(options);
             const ms = Date.now() - t0;
             void writeUsageLog({
               event: "refresh",
@@ -354,7 +473,7 @@ export default Plugin.define({
               message: result.ok ? undefined : result.message.slice(0, 120),
             });
             mutate((draft: UsageState) => {
-              const previous = draft.providers[id]!;
+              const previous = draft.providers[id] ?? initialSnapshot(id);
               const now = Date.now();
               // A shared cooldown is active (persisted, syncs across TUI
               // instances): keep the snapshot and do not call the API.
@@ -385,7 +504,12 @@ export default Plugin.define({
                 limitedUntil: result.ok ? result.limitedUntil : undefined,
                 cacheUntil: result.ok ? result.cacheUntil : undefined,
                 state: result.ok
-                  ? { status: "ok", plan: result.plan, windows: result.windows }
+                  ? {
+                      status: "ok",
+                      plan: result.plan,
+                      windows: result.windows,
+                      accounts: result.accounts,
+                    }
                   : result.kind === "missing"
                     ? { status: "missing", message: result.message }
                     : { status: "error", message: result.message },
