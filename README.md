@@ -29,6 +29,10 @@ Go     5h ──────────── 0% 2h
 - Percentages are **remaining** quota (not used), colors: green > 30%, yellow ≤ 30%, red ≤ 10%.
 - Claude shows **every account connected in OpenCode** (`/connect`, OAuth kept fresh by the
   anthropic auth plugin), each with its own windows and a masked email underneath.
+- Claude is fetched **on demand** — at startup, after each finished turn and via `/usage` —
+  and otherwise on an idle ramp: 2 → 4 → 8 → 15 min between fetches. The cache window is
+  persisted, so two open TUI windows still produce a single fetch stream. Idle cost is
+  ~4 requests/h per account instead of 60.
 - Claude is fetched via the same OAuth endpoint the interactive `/usage` command uses,
   identified with a `claude-code/<version>` user agent (Anthropic throttles unknown agents).
 - Transient errors never blank the card: the last good snapshot is kept (10 min for errors,
