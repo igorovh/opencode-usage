@@ -3,9 +3,10 @@
  *
  * Accounts live in the OpenCode credential store (opencode.db, table
  * "credential", integration id "anthropic") and their OAuth rotation is owned
- * by the anthropic auth plugin (ex-machina) - this source only reads the
- * current snapshot. On a 401 it re-reads the store once (the token may have
- * been rotated mid-query) and retries.
+ * by the anthropic auth plugin (ex-machina). A connected Claude Agent
+ * (integration id "claude-agent") replaces them with the Claude Code login the
+ * Agent SDK uses. This source only reads the current snapshot. On a 401 it
+ * re-reads the store once (the token may have been rotated mid-query) and retries.
  *
  * Rate limits: honor Retry-After when present, otherwise exponential backoff
  * (max 15 min), tracked per account. While cooling down, serve that account's
@@ -156,24 +157,16 @@ async function queryClaudeAccount(
   const runtime = runtimeOf(account.id);
   const now = Date.now();
 
-  // The auth plugin owns rotation; a token known to be expired on disk should
-  // not be sent at all (it would just 401).
+  // The auth plugin / Claude Code owns rotation; a token known to be expired
+  // on disk should not be sent at all (it would just 401).
   if (account.expires !== undefined && account.expires <= now) {
+    const message =
+      account.source === "claude-agent"
+        ? "Claude: OAuth token expired - Claude Agent refreshes it on its next request."
+        : "Claude: OAuth token expired - reconnect the account in OpenCode.";
     return runtime.lastGood
-      ? outcome(
-          account,
-          label,
-          "ok",
-          runtime.lastGood,
-          "Claude: OAuth token expired - reconnect the account in OpenCode.",
-        )
-      : outcome(
-          account,
-          label,
-          "missing",
-          [],
-          "Claude: OAuth token expired - reconnect the account in OpenCode.",
-        );
+      ? outcome(account, label, "ok", runtime.lastGood, message)
+      : outcome(account, label, "missing", [], message);
   }
 
   const remainingMs = runtime.rateLimitedUntil - now;
@@ -208,7 +201,9 @@ async function queryClaudeAccount(
     // A 401 usually means our snapshot went stale mid-query (the auth plugin
     // rotated the token): re-read the store once and retry with the new token.
     if (error instanceof HttpError && error.status === 401) {
-      const rotated = (await readOpencodeClaudeAccounts(true)).find((a) => a.id === account.id);
+      const rotated = (await readOpencodeClaudeAccounts(true)).accounts.find(
+        (a) => a.id === account.id,
+      );
       if (rotated && rotated.accessToken !== account.accessToken) {
         try {
           runtime.lastHttpAt = Date.now();
@@ -263,9 +258,13 @@ async function queryClaudeAccount(
 // ---------------------------------------------------------------------------
 
 export async function queryClaude(): Promise<QuotaResult> {
-  const accounts = await readOpencodeClaudeAccounts();
+  const { agent, accounts } = await readOpencodeClaudeAccounts();
   if (accounts.length === 0) {
-    return missingResult("No Claude account connected in OpenCode - connect one via /connect.");
+    return missingResult(
+      agent
+        ? "Claude Agent is connected but no Claude Code login was found - run `claude /login`."
+        : "No Claude account connected in OpenCode - connect one via /connect.",
+    );
   }
 
   const outcomes = await Promise.all(
