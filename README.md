@@ -29,6 +29,9 @@ Go     5h ──────────── 0% 2h
 - Percentages are **remaining** quota (not used), colors: green > 30%, yellow ≤ 30%, red ≤ 10%.
 - Claude shows **every account connected in OpenCode** (`/connect`, OAuth kept fresh by the
   anthropic auth plugin), each with its own windows and a masked email underneath.
+  When the **Claude Agent** integration is connected, it replaces those accounts with the
+  Claude Code login the Agent SDK uses (`~/.claude/.credentials.json`, the macOS Keychain,
+  `CLAUDE_CONFIG_DIR` respected). The SDK refreshes that token; the plugin only reads it.
 - Claude is fetched **on demand** — at startup, after each finished turn and via `/usage` —
   and otherwise on an idle ramp: 2 → 4 → 8 → 15 min between fetches. The cache window is
   persisted, so two open TUI windows still produce a single fetch stream. Idle cost is
@@ -84,7 +87,7 @@ Register it in `~/.config/opencode/cli.json` (or `opencode.jsonc`) and restart t
 | Provider | Source | Auth |
 | --- | --- | --- |
 | Codex | `chatgpt.com/backend-api/wham/usage` | `~/.codex/auth.json` (ChatGPT login, not API key) or OpenCode auth.json `openai` |
-| Claude | `api.anthropic.com/api/oauth/usage` | OAuth tokens of every Claude account in OpenCode's credential store (`opencode.db`, `integration_id = "anthropic"`) - requires Pro/Max subscription |
+| Claude | `api.anthropic.com/api/oauth/usage` | OAuth tokens of every Claude account in OpenCode's credential store (`opencode.db`, `integration_id = "anthropic"`), or the Claude Code login when `claude-agent` is connected - requires Pro/Max subscription |
 | GLM | `api.z.ai` / `bigmodel.cn` `/api/monitor/usage/quota/limit` | OpenCode auth.json `zai-coding-plan` / `zhipu-coding-plan` or `ZAI_API_KEY` / `ZHIPU_API_KEY` |
 | Go | `opencode.ai/zen/go/v1/usage` | `OPENCODE_API_KEY` env or OpenCode auth.json `opencode-go` (then `opencode`), `type: "api"` |
 
