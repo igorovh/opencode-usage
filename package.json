@@ -1,25 +1,59 @@
 {
-  "name": "opencode2-usage",
-  "version": "0.1.0",
-  "description": "OpenCode 2 (beta) TUI plugin: Codex / Claude / GLM usage in the sidebar and prompt footer",
+  "name": "opencode-usage",
+  "version": "0.2.0",
+  "description": "Codex, Claude, GLM Coding Plan and OpenCode Go usage limits in the OpenCode TUI sidebar and prompt footer",
   "type": "module",
+  "license": "MIT",
+  "author": "igorovh",
+  "homepage": "https://github.com/igorovh/opencode-usage#readme",
+  "bugs": {
+    "url": "https://github.com/igorovh/opencode-usage/issues"
+  },
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/igorovh/opencode-usage.git"
+  },
+  "keywords": ["opencode", "opencode-plugin", "tui", "usage", "quota", "rate-limit", "claude", "codex", "glm"],
+  "files": ["dist", "src", "tui.ts", "README.md", "LICENSE"],
   "exports": {
-    ".": "./src/index.ts",
-    "./tui": "./src/tui.tsx"
+    "./tui": "./dist/tui.js"
   },
   "scripts": {
+    "compile": "bun scripts/compile.ts",
     "typecheck": "tsc --noEmit",
-    "check:usage": "bun scripts/check.ts"
+    "test": "bun test",
+    "check:usage": "bun scripts/check.ts",
+    "demo": "bun --preload @opentui/solid/preload scripts/demo.tsx"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.2.5",
+    "@opentui/core": ">=0.8.0",
+    "@opentui/solid": ">=0.8.0",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
-    "@opencode/client": "beta",
-    "@opencode/plugin": "beta",
-    "@opencode/theme": "beta",
-    "@opentui/core": "0.5.10",
-    "@opentui/solid": "0.5.10",
-    "@types/bun": "latest",
-    "solid-js": "^1.9.9",
-    "typescript": "5.8.2"
+    "@opencode/plugin": "2.2.5",
+    "@opencode/theme": "2.2.5",
+    "@opentui/core": "0.8.2",
+    "@opentui/solid": "0.8.2",
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/bun": "1.4.4",
+    "solid-js": "1.9.18",
+    "typescript": "5.9.3"
   }
 }
