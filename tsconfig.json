@@ -14,5 +14,5 @@
     "types": ["bun"],
     "lib": ["ES2023", "DOM"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "scripts/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "scripts/**/*.ts", "scripts/**/*.tsx", "test/**/*.ts"]
 }

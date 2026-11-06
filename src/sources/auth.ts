@@ -1,10 +1,10 @@
 /**
  * Credential discovery for the providers.
  *
- * - OpenCode auth.json stores OAuth/API keys created via `/connect` (provider ids
- *   like "openai", "anthropic", "zai-coding-plan", ...).
- * - Claude accounts (multi-account) live in OpenCode's sqlite credential store;
- *   the Claude Agent integration only marks itself there and uses Claude Code's login.
+ * - OpenCode V2 keeps `/connect` credentials in its store. The TUI reads them through
+ *   `client.credential.list()`; standalone scripts fall back to reading opencode.db.
+ * - The V1 auth.json is still read as a last resort for older installs.
+ * - The Claude Agent integration only marks itself in the store and uses Claude Code's login.
  * - Codex CLI stores OAuth tokens in ~/.codex/auth.json.
  *
  * Only token *values* are returned; callers must not log them.
@@ -37,125 +37,38 @@ function firstString(value: unknown, keys: string[]): string | undefined {
   return undefined;
 }
 
-// ---------------------------------------------------------------------------
-// OpenCode auth.json
-// ---------------------------------------------------------------------------
-
-let opencodeAuthCache: { at: number; value: Json | null } | undefined;
-
-function opencodeDataDirs(): string[] {
-  const home = homedir();
-  const dirs: string[] = [];
-  const xdgData = process.env["XDG_DATA_HOME"]?.trim();
-  if (xdgData) dirs.push(xdgData);
-  dirs.push(join(home, ".local", "share", "opencode"));
-  if (process.platform === "darwin") {
-    dirs.push(join(home, "Library", "Application Support", "opencode"));
-  }
-  if (process.platform === "win32" && process.env["LOCALAPPDATA"]) {
-    dirs.push(join(process.env["LOCALAPPDATA"], "opencode"));
-  }
-  return dirs;
-}
-
-export async function readOpencodeAuth(): Promise<Json | null> {
-  const now = Date.now();
-  if (opencodeAuthCache && now - opencodeAuthCache.at < CACHE_TTL_MS) {
-    return opencodeAuthCache.value;
-  }
-  // Explicit file override (used by opencode itself).
-  const explicit = process.env["OPENCODE_AUTH_JSON"]?.trim();
-  if (explicit) {
-    try {
-      const content = await readFile(explicit, "utf8");
-      const parsed = asRecord(JSON.parse(content));
-      if (parsed) {
-        opencodeAuthCache = { at: now, value: parsed };
-        return parsed;
-      }
-    } catch {
-      // fall through to the standard locations
-    }
-  }
-  let value: Json | null = null;
-  for (const dir of opencodeDataDirs()) {
-    try {
-      const content = await readFile(join(dir, "auth.json"), "utf8");
-      const parsed = asRecord(JSON.parse(content));
-      if (parsed) {
-        value = parsed;
-        break;
-      }
-    } catch {
-      // try next candidate
-    }
-  }
-  opencodeAuthCache = { at: now, value };
-  return value;
-}
-
-export interface OpencodeAuthEntry {
-  type?: string;
-  key?: string;
-  apiKey?: string;
-  access?: string;
-  refresh?: string;
-  expires?: number;
-  accountId?: string;
-}
-
-/** Returns the auth.json entry for a provider id, e.g. "zai-coding-plan". */
-export async function opencodeAuthEntry(
-  providerIds: readonly string[],
-): Promise<{ id: string; entry: OpencodeAuthEntry } | undefined> {
-  const auth = await readOpencodeAuth();
-  if (!auth) return undefined;
-  for (const id of providerIds) {
-    const entry = asRecord(auth[id]);
-    if (entry) return { id, entry: entry as OpencodeAuthEntry };
-  }
-  return undefined;
+/** `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode` - the same on every OS. */
+export function opencodeDataDir(): string {
+  const xdg = process.env["XDG_DATA_HOME"]?.trim();
+  return join(xdg || join(homedir(), ".local", "share"), "opencode");
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode credential store (sqlite)
+// OpenCode credential store
 // ---------------------------------------------------------------------------
 
-/** One Claude account from the OpenCode credential store. */
-export interface OpencodeClaudeAccount {
-  /** Credential row id - stable key for per-account caches. */
+/** One stored credential, normalized from the client API or the sqlite store. */
+export interface StoredCredential {
   id: string;
-  /** "claude-agent" tokens come from the Claude Code login the Agent SDK uses. */
-  source: "anthropic" | "claude-agent";
-  /** Account email parsed from the credential label, when present. */
-  email?: string;
-  accessToken: string;
-  refreshToken?: string;
-  /** Epoch ms; the auth plugin rotates tokens behind this store. */
-  expires?: number;
-  /** OpenCode marks this account as the one used for new sessions. */
+  integrationID: string;
+  label: string;
   active: boolean;
+  value: Json;
 }
 
-export interface OpencodeClaudeAccounts {
-  /** Claude Agent is connected: legacy "anthropic" accounts are hidden. */
-  agent: boolean;
-  accounts: OpencodeClaudeAccount[];
+type CredentialLister = () => Promise<readonly StoredCredential[]>;
+
+let credentialLister: CredentialLister | undefined;
+let credentialCache: { at: number; value: readonly StoredCredential[] } | undefined;
+
+/** The TUI plugin registers the host client here; without it the sqlite store is read. */
+export function setCredentialLister(lister: CredentialLister | undefined): void {
+  credentialLister = lister;
+  credentialCache = undefined;
 }
 
-let claudeAccountsCache: { at: number; value: OpencodeClaudeAccounts } | undefined;
-
-function opencodeDbPaths(): string[] {
-  const paths: string[] = [];
-  for (const dir of opencodeDataDirs()) {
-    paths.push(join(dir, "opencode.db"), join(dir, "opencode-next.db"));
-  }
-  return [...new Set(paths)];
-}
-
-function emailFromLabel(label: unknown): string | undefined {
-  if (typeof label !== "string") return undefined;
-  return label.match(/[\w.+-]+@[\w.-]+\.\w+/)?.[0];
+function opencodeDbPath(): string {
+  return process.env["OPENCODE_DB"]?.trim() || join(opencodeDataDir(), "opencode.db");
 }
 
 interface CredentialRow {
@@ -166,38 +79,156 @@ interface CredentialRow {
   active: number | null;
 }
 
-async function readCredentialRows(integrationIds: readonly string[]): Promise<CredentialRow[]> {
-  const rows: CredentialRow[] = [];
+async function readCredentialRows(): Promise<StoredCredential[]> {
+  const path = opencodeDbPath();
+  if (!existsSync(path)) return [];
   try {
     const { Database } = await import("bun:sqlite");
-    const placeholders = integrationIds.map(() => "?").join(", ");
-    for (const path of opencodeDbPaths()) {
-      if (!existsSync(path)) continue;
-      // Read-only + WAL lets this run alongside the TUI that owns the store.
-      let db: { query(sql: string): { all(...params: unknown[]): unknown[] } ; close(): void };
-      try {
-        db = new Database(path, { readonly: true });
-      } catch {
-        continue;
-      }
-      try {
-        rows.push(
-          ...(db
-            .query(
-              `select id, integration_id, label, value, active from credential where integration_id in (${placeholders})`,
-            )
-            .all(...integrationIds) as CredentialRow[]),
-        );
-      } catch {
-        // store without a credential table
-      } finally {
-        db.close();
-      }
+    // Read-only + WAL lets this run alongside the TUI that owns the store.
+    const db = new Database(path, { readonly: true });
+    try {
+      const rows = db
+        .query("select id, integration_id, label, value, active from credential")
+        .all() as CredentialRow[];
+      return rows.flatMap((row) => {
+        try {
+          const value = asRecord(JSON.parse(row.value));
+          if (!value) return [];
+          return [{
+            id: row.id,
+            integrationID: row.integration_id,
+            label: row.label ?? "",
+            active: row.active === 1,
+            value,
+          }];
+        } catch {
+          return [];
+        }
+      });
+    } finally {
+      db.close();
     }
   } catch {
-    // bun:sqlite unavailable - treat as no accounts
+    // no bun:sqlite, or a store without a credential table
+    return [];
   }
-  return rows;
+}
+
+export async function listCredentials(force = false): Promise<readonly StoredCredential[]> {
+  const now = Date.now();
+  if (!force && credentialCache && now - credentialCache.at < CACHE_TTL_MS) return credentialCache.value;
+  let value: readonly StoredCredential[] | undefined;
+  if (credentialLister) {
+    try {
+      value = await credentialLister();
+    } catch {
+      // server unreachable - fall back to the store on disk
+    }
+  }
+  value ??= await readCredentialRows();
+  credentialCache = { at: now, value };
+  return value;
+}
+
+/** Credentials for the first integration id that has any, active ones first. */
+export async function credentialsFor(integrationIds: readonly string[]): Promise<StoredCredential[]> {
+  const all = await listCredentials();
+  for (const id of integrationIds) {
+    const matches = all.filter((credential) => credential.integrationID === id);
+    if (matches.length > 0) return matches.sort((a, b) => Number(b.active) - Number(a.active));
+  }
+  return [];
+}
+
+export function credentialKey(credential: StoredCredential): string | undefined {
+  return credential.value["type"] === "key" ? firstString(credential.value, ["key"]) : undefined;
+}
+
+export function credentialOAuth(
+  credential: StoredCredential,
+): { access: string; refresh?: string; expires?: number; metadata?: Json } | undefined {
+  if (credential.value["type"] !== "oauth") return undefined;
+  const access = firstString(credential.value, ["access"]);
+  if (!access) return undefined;
+  const expires = credential.value["expires"];
+  return {
+    access,
+    refresh: firstString(credential.value, ["refresh"]),
+    expires: typeof expires === "number" ? expires : undefined,
+    metadata: asRecord(credential.value["metadata"]),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Legacy V1 auth.json
+// ---------------------------------------------------------------------------
+
+let legacyAuthCache: { at: number; value: Json | null } | undefined;
+
+async function readLegacyAuth(): Promise<Json | null> {
+  const now = Date.now();
+  if (legacyAuthCache && now - legacyAuthCache.at < CACHE_TTL_MS) return legacyAuthCache.value;
+  let value: Json | null = null;
+  try {
+    value = asRecord(JSON.parse(await readFile(join(opencodeDataDir(), "auth.json"), "utf8"))) ?? null;
+  } catch {
+    // no V1 auth.json
+  }
+  legacyAuthCache = { at: now, value };
+  return value;
+}
+
+export interface LegacyAuthEntry {
+  type?: string;
+  key?: string;
+  access?: string;
+  expires?: number;
+  accountId?: string;
+}
+
+/** Returns the V1 auth.json entry for the first matching provider id. */
+export async function legacyAuthEntry(
+  providerIds: readonly string[],
+): Promise<{ id: string; entry: LegacyAuthEntry } | undefined> {
+  const auth = await readLegacyAuth();
+  if (!auth) return undefined;
+  for (const id of providerIds) {
+    const entry = asRecord(auth[id]);
+    if (entry) return { id, entry: entry as LegacyAuthEntry };
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Claude accounts
+// ---------------------------------------------------------------------------
+
+/** One Claude account from the OpenCode credential store. */
+export interface OpencodeClaudeAccount {
+  /** Credential id - stable key for per-account caches. */
+  id: string;
+  /** "claude-agent" tokens come from the Claude Code login the Agent SDK uses. */
+  source: "anthropic" | "claude-agent";
+  /** Account email parsed from the credential label, when present. */
+  email?: string;
+  accessToken: string;
+  /** Epoch ms; whoever owns the login rotates tokens behind this store. */
+  expires?: number;
+  /** OpenCode marks this account as the one used for new sessions. */
+  active: boolean;
+}
+
+export interface OpencodeClaudeAccounts {
+  /** Claude Agent is connected: "anthropic" OAuth accounts are hidden. */
+  agent: boolean;
+  accounts: OpencodeClaudeAccount[];
+}
+
+let claudeAccountsCache: { at: number; value: OpencodeClaudeAccounts } | undefined;
+
+function emailFromLabel(label: unknown): string | undefined {
+  if (typeof label !== "string") return undefined;
+  return label.match(/[\w.+-]+@[\w.-]+\.\w+/)?.[0];
 }
 
 function claudeConfigDir(): string | undefined {
@@ -252,62 +283,54 @@ async function readClaudeCodeEmail(): Promise<string | undefined> {
   }
 }
 
-async function readClaudeAgentAccount(row: CredentialRow): Promise<OpencodeClaudeAccount | undefined> {
+async function readClaudeAgentAccount(credential: StoredCredential): Promise<OpencodeClaudeAccount | undefined> {
   const oauth = await readClaudeCodeLogin();
   const access = firstString(oauth, ["accessToken"]);
   if (!access) return undefined;
   return {
-    id: row.id,
+    id: credential.id,
     source: "claude-agent",
-    email: (await readClaudeCodeEmail()) ?? emailFromLabel(row.label),
+    email: (await readClaudeCodeEmail()) ?? emailFromLabel(credential.label),
     accessToken: access,
-    refreshToken: firstString(oauth, ["refreshToken"]),
     expires: typeof oauth?.["expiresAt"] === "number" ? oauth["expiresAt"] : undefined,
     active: true,
   };
 }
 
-function anthropicAccount(row: CredentialRow): OpencodeClaudeAccount | undefined {
-  try {
-    const parsed = asRecord(JSON.parse(row.value));
-    const access = firstString(parsed, ["access", "accessToken"]);
-    if (!access) return undefined;
-    return {
-      id: row.id,
-      source: "anthropic",
-      email: emailFromLabel(row.label),
-      accessToken: access,
-      refreshToken: firstString(parsed, ["refresh", "refreshToken"]),
-      expires: typeof parsed?.expires === "number" ? parsed.expires : undefined,
-      active: row.active === 1,
-    };
-  } catch {
-    return undefined;
-  }
+function anthropicAccount(credential: StoredCredential): OpencodeClaudeAccount | undefined {
+  const oauth = credentialOAuth(credential);
+  if (!oauth) return undefined;
+  return {
+    id: credential.id,
+    source: "anthropic",
+    email: emailFromLabel(credential.label),
+    accessToken: oauth.access,
+    expires: oauth.expires,
+    active: credential.active,
+  };
 }
 
 /**
  * Claude accounts connected in OpenCode. A connected Claude Agent wins and
- * hides the legacy "anthropic" OAuth accounts. Read-only: token rotation stays
- * with the auth plugin / Claude Code, this only snapshots what is stored.
+ * hides the "anthropic" OAuth accounts. Read-only: token rotation stays with
+ * whoever owns the login, this only snapshots what is stored.
  */
 export async function readOpencodeClaudeAccounts(force = false): Promise<OpencodeClaudeAccounts> {
   const now = Date.now();
   if (!force && claudeAccountsCache && now - claudeAccountsCache.at < CACHE_TTL_MS) {
     return claudeAccountsCache.value;
   }
-  const rows = await readCredentialRows(["anthropic", "claude-agent"]);
-  const agentRow = rows.find((row) => row.integration_id === "claude-agent");
+  const all = await listCredentials(force);
+  const agent = all.find((credential) => credential.integrationID === "claude-agent");
   let value: OpencodeClaudeAccounts;
-  if (agentRow) {
-    const account = await readClaudeAgentAccount(agentRow);
+  if (agent) {
+    const account = await readClaudeAgentAccount(agent);
     value = { agent: true, accounts: account ? [account] : [] };
   } else {
-    const seen = new Set<string>();
-    const accounts = rows
+    const accounts = all
+      .filter((credential) => credential.integrationID === "anthropic")
       .map(anthropicAccount)
-      .filter((account): account is OpencodeClaudeAccount => !!account)
-      .filter((account) => (seen.has(account.id) ? false : (seen.add(account.id), true)));
+      .filter((account): account is OpencodeClaudeAccount => !!account);
     accounts.sort((a, b) => Number(b.active) - Number(a.active) || a.id.localeCompare(b.id));
     value = { agent: false, accounts };
   }
@@ -328,14 +351,10 @@ export async function codexCliTokens(): Promise<CodexTokens | undefined> {
   const codexHome = process.env["CODEX_HOME"]?.trim() || join(homedir(), ".codex");
   try {
     const content = await readFile(join(codexHome, "auth.json"), "utf8");
-    const parsed = asRecord(JSON.parse(content));
-    const tokens = asRecord(parsed?.["tokens"]);
+    const tokens = asRecord(asRecord(JSON.parse(content))?.["tokens"]);
     const accessToken = firstString(tokens, ["access_token"]);
     if (!accessToken) return undefined;
-    return {
-      accessToken,
-      accountId: firstString(tokens, ["account_id"]),
-    };
+    return { accessToken, accountId: firstString(tokens, ["account_id"]) };
   } catch {
     return undefined;
   }
@@ -346,7 +365,6 @@ export async function codexCliTokens(): Promise<CodexTokens | undefined> {
 // ---------------------------------------------------------------------------
 
 interface OpenAiJwtPayload {
-  "https://api.openai.com/profile"?: { email?: string };
   "https://api.openai.com/auth"?: { chatgpt_account_id?: string };
 }
 
@@ -360,8 +378,12 @@ export function parseOpenAiJwt(token: string): OpenAiJwtPayload | undefined {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return undefined;
-    return asRecord(JSON.parse(base64UrlDecode(parts[1])!)) as OpenAiJwtPayload | undefined;
+    return asRecord(JSON.parse(base64UrlDecode(parts[1]!))) as OpenAiJwtPayload | undefined;
   } catch {
     return undefined;
   }
+}
+
+export function stringField(value: unknown, key: string): string | undefined {
+  return firstString(value, [key]);
 }

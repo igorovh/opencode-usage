@@ -2,22 +2,26 @@
  * Codex (ChatGPT) usage via https://chatgpt.com/backend-api/wham/usage
  *
  * Token sources, in order:
- * 1. OpenCode auth.json OAuth entries ("openai", "codex", "chatgpt", "opencode")
- * 2. Codex CLI credentials at ~/.codex/auth.json
+ * 1. Codex CLI credentials at $CODEX_HOME/auth.json (~/.codex), refreshed by `codex login`
+ * 2. The OpenCode "openai" OAuth credential (ChatGPT login via /connect)
+ * 3. The V1 auth.json "openai" entry
  */
 
 import {
   codexCliTokens,
-  opencodeAuthEntry,
+  credentialOAuth,
+  credentialsFor,
+  legacyAuthEntry,
   parseOpenAiJwt,
-  type OpencodeAuthEntry,
+  stringField,
 } from "./auth";
-import { clampPct, fetchJson, isoFromNowPlusSeconds, toIso } from "./http";
+import { clampPct, describe, fetchJson, HttpError, isoFromNowPlusSeconds, rateLimitedUntil, toIso } from "./http";
 import { errorResult, missingResult, type QuotaResult, type UsageWindow } from "./types";
 
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 
-const OPENAI_AUTH_KEYS = ["openai", "codex", "chatgpt", "opencode"] as const;
+const OPENAI_IDS = ["openai"] as const;
+const USER_AGENT = "opencode-usage";
 
 interface WhamWindow {
   used_percent?: number;
@@ -55,7 +59,7 @@ function resetFromWindow(window: WhamWindow): string | undefined {
   return toIso(window.reset_at) ?? isoFromNowPlusSeconds(window.reset_after_seconds);
 }
 
-function parseWindows(response: WhamUsageResponse): UsageWindow[] {
+export function parseWindows(response: WhamUsageResponse): UsageWindow[] {
   const windows: UsageWindow[] = [];
   const seen = new Set<string>();
   for (const window of [response.rate_limit?.primary_window, response.rate_limit?.secondary_window]) {
@@ -69,52 +73,57 @@ function parseWindows(response: WhamUsageResponse): UsageWindow[] {
   return windows;
 }
 
-async function tokenCandidates(): Promise<{ accessToken: string; accountId?: string }[]> {
-  const candidates: { accessToken: string; accountId?: string }[] = [];
-
-  // Codex CLI credentials first: `codex login` refreshes them, while the
-  // OpenCode auth.json entry can stay stale for a long time.
-  const cli = await codexCliTokens();
-  if (cli) candidates.push({ accessToken: cli.accessToken, accountId: cli.accountId });
-
-  const entry = await opencodeAuthEntry(OPENAI_AUTH_KEYS);
-  const fromOpencode = entry ? oauthAccessToken(entry.entry) : undefined;
-  if (fromOpencode) {
-    const expired = typeof entry?.entry.expires === "number" && entry.entry.expires < Date.now();
-    if (!expired) {
-      const jwt = parseOpenAiJwt(fromOpencode);
-      candidates.push({
-        accessToken: fromOpencode,
-        accountId:
-          jwt?.["https://api.openai.com/auth"]?.chatgpt_account_id ?? entry?.entry.accountId,
-      });
-    }
-  }
-
-  return candidates;
+interface CodexCandidate {
+  accessToken: string;
+  accountId?: string;
 }
 
-function oauthAccessToken(entry: OpencodeAuthEntry): string | undefined {
-  if (entry.type && entry.type !== "oauth") return undefined;
-  return entry.access?.trim() || undefined;
+function accountIdFrom(token: string, fallback?: string): string | undefined {
+  return parseOpenAiJwt(token)?.["https://api.openai.com/auth"]?.chatgpt_account_id ?? fallback;
+}
+
+async function tokenCandidates(): Promise<CodexCandidate[]> {
+  const candidates: CodexCandidate[] = [];
+  const now = Date.now();
+
+  // Codex CLI first: `codex login` keeps it fresh, while stored OAuth can go stale.
+  const cli = await codexCliTokens();
+  if (cli) candidates.push(cli);
+
+  for (const credential of await credentialsFor(OPENAI_IDS)) {
+    const oauth = credentialOAuth(credential);
+    if (!oauth || (oauth.expires !== undefined && oauth.expires < now)) continue;
+    candidates.push({
+      accessToken: oauth.access,
+      accountId: accountIdFrom(oauth.access, stringField(oauth.metadata, "accountID")),
+    });
+  }
+
+  const legacy = await legacyAuthEntry(OPENAI_IDS);
+  const access = legacy?.entry.type === "oauth" ? legacy.entry.access?.trim() : undefined;
+  const expired = typeof legacy?.entry.expires === "number" && legacy.entry.expires < now;
+  if (access && !expired) candidates.push({ accessToken: access, accountId: accountIdFrom(access, legacy?.entry.accountId) });
+
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => !seen.has(candidate.accessToken) && !!seen.add(candidate.accessToken));
 }
 
 export async function queryCodex(): Promise<QuotaResult> {
   const candidates = await tokenCandidates();
   if (candidates.length === 0) {
     return missingResult(
-      "No Codex/ChatGPT OAuth token found (connect via /connect or run `codex login`).",
+      "No Codex/ChatGPT OAuth token found (connect ChatGPT via /connect or run `codex login`).",
     );
   }
 
   let lastError: string | undefined;
   for (const tokens of candidates) {
-    // The ChatGPT backend occasionally 401s/429s valid tokens; one quick retry.
+    // The ChatGPT backend occasionally 401s valid tokens; one quick retry, then the next source.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const headers: Record<string, string> = {
           authorization: `Bearer ${tokens.accessToken}`,
-          "user-agent": "opencode2-usage/0.1",
+          "user-agent": USER_AGENT,
         };
         if (tokens.accountId) headers["chatgpt-account-id"] = tokens.accountId;
         const data = await fetchJson<WhamUsageResponse>(USAGE_URL, { headers });
@@ -123,13 +132,15 @@ export async function queryCodex(): Promise<QuotaResult> {
         const plan = data.plan_type ? capitalize(data.plan_type) : undefined;
         return { ok: true, plan, windows };
       } catch (error) {
+        const limitedUntil = rateLimitedUntil(error);
+        if (limitedUntil) return errorResult("Codex: rate limited (HTTP 429).", limitedUntil);
         lastError = describe(error, "Codex");
-        if (/HTTP 40[13]|HTTP 429/.test(lastError)) {
+        if (error instanceof HttpError && (error.status === 401 || error.status === 403)) {
           if (attempt === 0) {
             await new Promise((resolve) => setTimeout(resolve, 1_500));
             continue;
           }
-          break; // try the next credential source
+          break;
         }
         return errorResult(lastError);
       }
@@ -140,12 +151,4 @@ export async function queryCodex(): Promise<QuotaResult> {
 
 function capitalize(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-export function describe(error: unknown, provider: string): string {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/HTTP 401|HTTP 403/.test(message)) {
-    return `${provider}: unauthorized - token expired, re-authenticate.`;
-  }
-  return `${provider}: ${message}`;
 }

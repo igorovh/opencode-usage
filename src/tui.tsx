@@ -1,5 +1,5 @@
 /**
- * usage - OpenCode 2 (beta) TUI plugin.
+ * opencode-usage - OpenCode V2 TUI plugin.
  *
  * Shows Codex / Claude / GLM Coding Plan / OpenCode Go usage:
  * - a card in the session sidebar (slot "sidebar.content")
@@ -13,11 +13,12 @@
 /** @jsxImportSource @opentui/solid */
 
 import { Plugin, usePlugin } from "@opencode/plugin/tui";
-import type { RGBA } from "@opentui/core";
 import { For, Show } from "solid-js";
 import { formatReset, renderBar, shortStatus } from "./format";
-import { writeUsageLog } from "./sources/log";
-import { queryClaude } from "./sources/claude";
+import { PROVIDER_IDS, parseOptions, type UsageOptions } from "./options";
+import { setCredentialLister, type StoredCredential } from "./sources/auth";
+import { writeUsageLog, setUsageLog } from "./sources/log";
+import { queryClaude, setClaudeUserAgent } from "./sources/claude";
 import { queryCodex } from "./sources/codex";
 import { queryGlm } from "./sources/glm";
 import { queryOpencodeGo } from "./sources/opencode-go";
@@ -25,47 +26,12 @@ import type {
   ClaudeAccountUsage,
   ProviderId,
   ProviderSnapshot,
+  QuotaResult,
   UsageWindow,
 } from "./sources/types";
 
 type TuiContext = ReturnType<typeof usePlugin>;
 
-// Published SDK types lag host 2.0.x: text.default/subdued became base/muted, feedback .default became .base.
-type UsageTheme = {
-  readonly text: {
-    readonly base: RGBA
-    readonly muted: RGBA
-    readonly feedback: Readonly<Record<"success" | "warning" | "error", { readonly base: RGBA }>>
-  }
-}
-
-const themeOf = (ctx: TuiContext): UsageTheme => ctx.theme as unknown as UsageTheme
-
-// ---------------------------------------------------------------------------
-// Options
-// ---------------------------------------------------------------------------
-
-interface UsageOptions {
-  /** Refresh interval in ms (minimum 15000). Default 60000. */
-  refreshMs?: number;
-  /** Render the sidebar card. Default true. */
-  sidebar?: boolean;
-  /** Render the prompt footer line. Default true. */
-  footer?: boolean;
-  /** Render the home screen line. Default true. */
-  home?: boolean;
-  /** Enable/disable individual providers. Default: all enabled. */
-  providers?: Partial<Record<ProviderId, boolean>>;
-  /** OpenCode Go API key override (default: OPENCODE_API_KEY env, then auth.json). */
-  goApiKey?: string;
-  /** Alias for goApiKey (matches the standalone Go usage plugin). */
-  apiKey?: string;
-  /** OpenCode Go API base override (default: https://opencode.ai/zen/go). */
-  goBaseUrl?: string;
-}
-
-const DEFAULT_REFRESH_MS = 60_000;
-const MIN_REFRESH_MS = 15_000;
 /** How long the last successful usage stays displayed when a refresh errors. */
 const STALE_OK_MS = 10 * 60_000;
 
@@ -78,23 +44,19 @@ const CLAUDE_MAX_INTERVAL_MS = 15 * 60_000;
 // Provider registry + shared state
 // ---------------------------------------------------------------------------
 
-const PROVIDERS: Record<ProviderId, { label: string; query: (opts?: UsageOptions) => Promise<QueryOutcome> }> = {
+const PROVIDERS: Record<ProviderId, { label: string; query: (opts: UsageOptions) => Promise<QuotaResult> }> = {
   codex: { label: "Codex", query: () => queryCodex() },
   claude: { label: "Claude", query: () => queryClaude() },
   glm: { label: "GLM", query: () => queryGlm() },
   "opencode-go": {
     label: "Go",
-    query: (opts) => queryOpencodeGo({ apiKey: opts?.goApiKey ?? opts?.apiKey, baseUrl: opts?.goBaseUrl }),
+    query: (opts) => queryOpencodeGo({ apiKey: opts.goApiKey, baseUrl: opts.goBaseUrl }),
   },
 };
-
-const PROVIDER_IDS = Object.keys(PROVIDERS) as ProviderId[];
 
 /** Fixed label column width (from the full registry) so the 5h/7d bars
  * align across providers and never jump when one is offline or erroring. */
 const LABEL_WIDTH = Math.max(...PROVIDER_IDS.map((id) => PROVIDERS[id]!.label.length));
-
-type QueryOutcome = Awaited<ReturnType<typeof queryCodex>>;
 
 function initialSnapshot(id: ProviderId): ProviderSnapshot {
   return { id, label: PROVIDERS[id]!.label, state: { status: "missing" }, updatedAt: 0 };
@@ -106,18 +68,16 @@ interface UsageState {
 
 function initialState(): UsageState {
   return {
-    providers: {
-      codex: initialSnapshot("codex"),
-      claude: initialSnapshot("claude"),
-      glm: initialSnapshot("glm"),
-      "opencode-go": initialSnapshot("opencode-go"),
-    },
+    providers: Object.fromEntries(PROVIDER_IDS.map((id) => [id, initialSnapshot(id)])) as Record<
+      ProviderId,
+      ProviderSnapshot
+    >,
   };
 }
 
 /** Defensive read: durable storage may predate a provider (e.g. "opencode-go"
  * added in a later version), so a key can be absent - fall back to fresh. */
-export function snapOf(state: UsageState, id: ProviderId): ProviderSnapshot {
+function snapOf(state: UsageState, id: ProviderId): ProviderSnapshot {
   return state.providers[id] ?? initialSnapshot(id);
 }
 
@@ -154,7 +114,7 @@ function accountsOf(snapshot: ProviderSnapshot): readonly ClaudeAccountUsage[] {
 }
 
 function feedbackColor(ctx: TuiContext, window: UsageWindow) {
-  return themeOf(ctx).text.feedback[feedbackFor(remaining(window))].base;
+  return ctx.theme.text.feedback[feedbackFor(remaining(window))].base;
 }
 
 /** "not connected" or a short, human error label. */
@@ -193,7 +153,7 @@ function summary(snapshot: ProviderSnapshot): string {
 function UsageCommands(props: {
   ctx: TuiContext;
   refresh: (opts?: { force?: boolean }) => Promise<void>;
-  nextRefresh: () => number;
+  enabled: (id: ProviderId) => boolean;
   state: UsageState;
 }) {
   props.ctx.keymap.layer(() => ({
@@ -208,15 +168,11 @@ function UsageCommands(props: {
         suggested: true,
         run: async () => {
           await props.refresh({ force: true });
-          const lines = PROVIDER_IDS.filter((id) => snapOf(props.state, id).state.status === "ok")
+          const lines = PROVIDER_IDS.filter((id) => props.enabled(id) && snapOf(props.state, id).state.status === "ok")
             .flatMap((id) => {
               const snap = snapOf(props.state, id);
               const limited = limitedCountdown(snap);
-              const suffix = limited
-                ? ` (limited ${limited})`
-                : snap.id === "claude" && props.nextRefresh() > Date.now()
-                  ? ` (refresh in ${Math.max(1, Math.round((props.nextRefresh() - Date.now()) / 1000))}s)`
-                  : "";
+              const suffix = limited ? ` (limited ${limited})` : "";
               // Claude: one line per connected account.
               const accounts = accountsOf(snap);
               if (snap.id === "claude" && accounts.length > 0) {
@@ -248,22 +204,15 @@ function fiveHour(snapshot: ProviderSnapshot): UsageWindow | undefined {
   );
 }
 
-function StatusLine(props: { ctx: TuiContext; state: UsageState }) {
-  const theme = themeOf(props.ctx);
+function StatusLine(props: { ctx: TuiContext; state: UsageState; enabled: (id: ProviderId) => boolean }) {
+  const theme = props.ctx.theme;
   const visible = () =>
     PROVIDER_IDS.filter((id) => {
       const snap = snapOf(props.state, id);
-      return snap.state.status === "ok" && fiveHour(snap) !== undefined;
+      return props.enabled(id) && snap.state.status === "ok" && fiveHour(snap) !== undefined;
     });
   return (
-    <Show
-      when={visible().length > 0}
-      fallback={
-        <text fg={theme.text.muted} wrapMode="none">
-          usage: no data
-        </text>
-      }
-    >
+    <Show when={visible().length > 0}>
       <box flexDirection="row" gap={0}>
         <For each={visible()}>
           {(id, index) => {
@@ -298,7 +247,7 @@ function WindowRow(props: {
   window: UsageWindow;
   showLimited?: string | undefined;
 }) {
-  const theme = themeOf(props.ctx);
+  const theme = props.ctx.theme;
   return (
     <box flexDirection="row" gap={0}>
       <text fg={theme.text.base} wrapMode="none">
@@ -339,7 +288,7 @@ function ProviderWindowRows(props: { ctx: TuiContext; snapshot: ProviderSnapshot
 
 /** Per-account rows for Claude: windows per account, masked email underneath. */
 function ClaudeAccountRows(props: { ctx: TuiContext; snapshot: ProviderSnapshot }) {
-  const theme = themeOf(props.ctx);
+  const theme = props.ctx.theme;
   return (
     <For each={accountsOf(props.snapshot)}>
       {(account, accountIndex) => (
@@ -383,16 +332,15 @@ function ClaudeAccountRows(props: { ctx: TuiContext; snapshot: ProviderSnapshot 
   );
 }
 
-function SidebarCard(props: { ctx: TuiContext; state: UsageState }) {
+function SidebarCard(props: { ctx: TuiContext; state: UsageState; enabled: (id: ProviderId) => boolean }) {
   const ctx = props.ctx;
-  const theme = themeOf(ctx);
+  const theme = ctx.theme;
+  // Hide providers that are disabled in options or have no credentials at all.
+  const visible = () =>
+    PROVIDER_IDS.filter((id) => props.enabled(id) && snapOf(props.state, id).state.status !== "missing");
   return (
-    <box flexDirection="column" marginTop={1}>
-      <text fg={theme.text.muted} wrapMode="none">
-        Usage
-      </text>
-      <text wrapMode="none">{" "}</text>
-      <For each={PROVIDER_IDS}>
+    <box flexDirection="column">
+      <For each={visible()}>
         {(id, index) => {
           const snap = () => snapOf(props.state, id);
           return (
@@ -432,10 +380,24 @@ function SidebarCard(props: { ctx: TuiContext; state: UsageState }) {
 export default Plugin.define({
   id: "usage",
   setup(context) {
-    const options = (context.options ?? {}) as UsageOptions;
-    const refreshMs = Math.max(MIN_REFRESH_MS, options.refreshMs ?? DEFAULT_REFRESH_MS);
-    const enabled = (id: ProviderId): boolean => options.providers?.[id] !== false;
+    const options = parseOptions(context.options);
+    const refreshMs = options.refreshMs;
+    const enabled = (id: ProviderId): boolean => options.providers[id];
     const instanceId = Math.random().toString(36).slice(2, 8);
+
+    setUsageLog(options.log);
+    setClaudeUserAgent(options.claudeUserAgent);
+    setCredentialLister(async () =>
+      (await context.client.credential.list()).map(
+        (entry): StoredCredential => ({
+          id: entry.id,
+          integrationID: entry.integrationID,
+          label: entry.label,
+          active: entry.active,
+          value: entry.value as unknown as Record<string, unknown>,
+        }),
+      ),
+    );
 
     writeUsageLog({ event: "init", instance: instanceId, version: context.app.version });
 
@@ -453,117 +415,116 @@ export default Plugin.define({
       }
     });
 
-    let inFlight = false;
-    let nextRefreshAt = 0;
+    let inFlight: Promise<void> | undefined;
     let claudeRampMs = CLAUDE_BASE_INTERVAL_MS;
-    const refresh = async (opts?: { force?: boolean }): Promise<void> => {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        nextRefreshAt = Date.now() + refreshMs;
-        await Promise.all(
-          PROVIDER_IDS.filter(enabled).map(async (id) => {
-            const before = snapOf(state, id);
-            const now0 = Date.now();
-            // Shared rate-limit cooldown (persisted, syncs across TUI
-            // instances): do not call the API at all.
-            if (before.limitedUntil && before.limitedUntil > now0) {
-              void writeUsageLog({
-                event: "skip",
-                instance: instanceId,
-                provider: id,
-                reason: "limited",
-                limitedUntil: before.limitedUntil,
-              });
-              return;
-            }
-            // Claude: the timer tick is a no-op while the persisted cache
-            // window (idle ramp, 2..15 min) is fresh; turns and /usage force.
-            if (id === "claude" && !opts?.force && (before.cacheUntil ?? 0) > now0) {
-              void writeUsageLog({
-                event: "skip",
-                instance: instanceId,
-                provider: id,
-                reason: "cached",
-                cacheUntil: before.cacheUntil,
-              });
-              return;
-            }
-            const t0 = Date.now();
-            const result = await PROVIDERS[id]!.query(options);
-            const ms = Date.now() - t0;
+    // A refresh requested while one runs waits for it instead of returning stale data.
+    const refresh = (opts?: { force?: boolean }): Promise<void> => {
+      inFlight ??= runRefresh(opts).finally(() => {
+        inFlight = undefined;
+      });
+      return inFlight;
+    };
+    const runRefresh = async (opts?: { force?: boolean }): Promise<void> => {
+      await Promise.all(
+        PROVIDER_IDS.filter(enabled).map(async (id) => {
+          const before = snapOf(state, id);
+          const now0 = Date.now();
+          // Shared rate-limit cooldown (persisted, syncs across TUI
+          // instances): do not call the API at all.
+          if (before.limitedUntil && before.limitedUntil > now0) {
             void writeUsageLog({
-              event: "refresh",
+              event: "skip",
               instance: instanceId,
               provider: id,
-              ms,
-              outcome: result.ok ? (result.limitedUntil ? "limited" : "ok") : result.kind,
-              limitedUntil: result.ok ? result.limitedUntil : result.limitedUntil,
-              cooldownIn: result.limitedUntil
-                ? Math.round((result.limitedUntil - Date.now()) / 1000) + "s"
-                : undefined,
-              message: result.ok ? undefined : result.message.slice(0, 120),
+              reason: "limited",
+              limitedUntil: before.limitedUntil,
             });
-            mutate((draft: UsageState) => {
-              const previous = draft.providers[id] ?? initialSnapshot(id);
-              const now = Date.now();
-              // A shared cooldown is active (persisted, syncs across TUI
-              // instances): keep the snapshot and do not call the API.
-              if (previous.limitedUntil && previous.limitedUntil > now) {
-                void writeUsageLog({
-                  event: "skip",
-                  instance: instanceId,
-                  provider: id,
-                  limitedUntil: previous.limitedUntil,
-                });
+            return;
+          }
+          // Claude: the timer tick is a no-op while the persisted cache
+          // window (idle ramp, 2..15 min) is fresh; turns and /usage force.
+          if (id === "claude" && !opts?.force && (before.cacheUntil ?? 0) > now0) {
+            void writeUsageLog({
+              event: "skip",
+              instance: instanceId,
+              provider: id,
+              reason: "cached",
+              cacheUntil: before.cacheUntil,
+            });
+            return;
+          }
+          const t0 = Date.now();
+          const result = await PROVIDERS[id]!.query(options);
+          const ms = Date.now() - t0;
+          void writeUsageLog({
+            event: "refresh",
+            instance: instanceId,
+            provider: id,
+            ms,
+            outcome: result.ok ? (result.limitedUntil ? "limited" : "ok") : result.kind,
+            limitedUntil: result.ok ? result.limitedUntil : result.limitedUntil,
+            cooldownIn: result.limitedUntil
+              ? Math.round((result.limitedUntil - Date.now()) / 1000) + "s"
+              : undefined,
+            message: result.ok ? undefined : result.message.slice(0, 120),
+          });
+          mutate((draft: UsageState) => {
+            const previous = draft.providers[id] ?? initialSnapshot(id);
+            const now = Date.now();
+            // A shared cooldown is active (persisted, syncs across TUI
+            // instances): keep the snapshot and do not call the API.
+            if (previous.limitedUntil && previous.limitedUntil > now) {
+              void writeUsageLog({
+                event: "skip",
+                instance: instanceId,
+                provider: id,
+                limitedUntil: previous.limitedUntil,
+              });
+              return;
+            }
+            // Keep the last good data when a provider hiccups (429, flaky
+            // 401, timeout): a transient error must not blank the card.
+            if (!result.ok && result.kind === "error") {
+              if (result.limitedUntil && previous.state.status === "ok") {
+                draft.providers[id] = { ...previous, limitedUntil: result.limitedUntil };
                 return;
               }
-              // Keep the last good data when a provider hiccups (429, flaky
-              // 401, timeout): a transient error must not blank the card.
-              if (!result.ok && result.kind === "error") {
-                if (result.limitedUntil && previous.state.status === "ok") {
-                  draft.providers[id] = { ...previous, limitedUntil: result.limitedUntil };
-                  return;
-                }
-                if (previous.state.status === "ok" && now - previous.updatedAt < STALE_OK_MS) {
-                  return;
-                }
+              if (previous.state.status === "ok" && now - previous.updatedAt < STALE_OK_MS) {
+                return;
               }
-              // cacheUntil drives the next allowed fetch: the source's own
-              // window when it served cache, otherwise the idle ramp (fresh
-              // HTTP call only). A rate-limit cooldown supersedes it.
-              let cacheUntil: number | undefined;
-              if (result.ok && !result.limitedUntil) {
-                if (result.cacheUntil !== undefined) {
-                  cacheUntil = result.cacheUntil;
-                } else if (id === "claude") {
-                  cacheUntil = Date.now() + claudeRampMs;
-                  claudeRampMs = Math.min(CLAUDE_MAX_INTERVAL_MS, claudeRampMs * 2);
-                }
+            }
+            // cacheUntil drives the next allowed fetch: the source's own
+            // window when it served cache, otherwise the idle ramp (fresh
+            // HTTP call only). A rate-limit cooldown supersedes it.
+            let cacheUntil: number | undefined;
+            if (result.ok && !result.limitedUntil) {
+              if (result.cacheUntil !== undefined) {
+                cacheUntil = result.cacheUntil;
+              } else if (id === "claude") {
+                cacheUntil = Date.now() + claudeRampMs;
+                claudeRampMs = Math.min(CLAUDE_MAX_INTERVAL_MS, claudeRampMs * 2);
               }
-              draft.providers[id] = {
-                id,
-                label: PROVIDERS[id]!.label,
-                updatedAt: now,
-                limitedUntil: result.ok ? result.limitedUntil : undefined,
-                cacheUntil,
-                state: result.ok
-                  ? {
-                      status: "ok",
-                      plan: result.plan,
-                      windows: result.windows,
-                      accounts: result.accounts,
-                    }
-                  : result.kind === "missing"
-                    ? { status: "missing", message: result.message }
-                    : { status: "error", message: result.message },
-              };
-            });
-          }),
-        );
-      } finally {
-        inFlight = false;
-      }
+            }
+            draft.providers[id] = {
+              id,
+              label: PROVIDERS[id]!.label,
+              updatedAt: now,
+              limitedUntil: result.limitedUntil,
+              cacheUntil,
+              state: result.ok
+                ? {
+                    status: "ok",
+                    plan: result.plan,
+                    windows: result.windows,
+                    accounts: result.accounts,
+                  }
+                : result.kind === "missing"
+                  ? { status: "missing", message: result.message }
+                  : { status: "error", message: result.message },
+            };
+          });
+        }),
+      );
     };
 
     let lastExecutionRefresh = 0;
@@ -586,7 +547,7 @@ export default Plugin.define({
       unregisterSlots.push(
         context.ui.slot({
           append: "sidebar.content",
-          render: () => <SidebarCard ctx={context} state={state} />,
+          render: () => <SidebarCard ctx={context} state={state} enabled={enabled} />,
         }),
       );
     }
@@ -594,7 +555,7 @@ export default Plugin.define({
       unregisterSlots.push(
         context.ui.slot({
           append: "prompt.footer.status",
-          render: () => <StatusLine ctx={context} state={state} />,
+          render: () => <StatusLine ctx={context} state={state} enabled={enabled} />,
         }),
       );
     }
@@ -604,7 +565,7 @@ export default Plugin.define({
           append: "home.footer",
           render: () => (
             <box justifyContent="center">
-              <StatusLine ctx={context} state={state} />
+              <StatusLine ctx={context} state={state} enabled={enabled} />
             </box>
           ),
         }),
@@ -614,7 +575,7 @@ export default Plugin.define({
     unregisterSlots.push(
       context.ui.slot({
         append: "app",
-        render: () => <UsageCommands ctx={context} refresh={refresh} nextRefresh={() => nextRefreshAt} state={state} />,
+        render: () => <UsageCommands ctx={context} refresh={refresh} enabled={enabled} state={state} />,
       }),
     );
 
@@ -622,7 +583,11 @@ export default Plugin.define({
       clearInterval(timer);
       clearTimeout(initialTimer);
       stopExecutionListener();
+      setCredentialLister(undefined);
       for (const unregister of unregisterSlots) unregister();
     };
   },
 });
+
+/** Rendered by scripts/demo.tsx for the README screenshot. */
+export { SidebarCard, StatusLine, type UsageState };

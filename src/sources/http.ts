@@ -50,6 +50,28 @@ export async function fetchJson<T>(
   }
 }
 
+/** Cooldown when a 429 carries no Retry-After. */
+const DEFAULT_RATE_LIMIT_MS = 5 * 60_000;
+const MAX_RATE_LIMIT_MS = 30 * 60_000;
+
+export function describe(error: unknown, provider: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/HTTP 401/.test(message)) return `${provider}: unauthorized - token expired, re-authenticate.`;
+  if (/HTTP 403/.test(message)) return `${provider}: forbidden - no subscription or access (HTTP 403).`;
+  return `${provider}: ${message}`;
+}
+
+/** Epoch ms until the next call is allowed after a 429; undefined for other errors. */
+export function rateLimitedUntil(error: unknown, now = Date.now()): number | undefined {
+  if (!(error instanceof HttpError) || error.status !== 429) return undefined;
+  const wait = error.retryAfterMs && error.retryAfterMs > 0 ? error.retryAfterMs : DEFAULT_RATE_LIMIT_MS;
+  return now + Math.min(MAX_RATE_LIMIT_MS, wait);
+}
+
+export function formatWait(ms: number): string {
+  return ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`;
+}
+
 export function clampPct(value: unknown): number {
   const n = typeof value === "number" && Number.isFinite(value) ? value : 0;
   return Math.min(100, Math.max(0, n));

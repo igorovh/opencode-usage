@@ -67,8 +67,8 @@ export type QuotaResult =
       limitedUntil?: number;
     };
 
-export function errorResult(message: string): QuotaResult {
-  return { ok: false, kind: "error", message };
+export function errorResult(message: string, limitedUntil?: number): QuotaResult {
+  return { ok: false, kind: "error", message, limitedUntil };
 }
 
 export function missingResult(message: string): QuotaResult {

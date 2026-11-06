@@ -2,16 +2,15 @@
  * GLM Coding Plan (Z.ai / Zhipu) usage via /api/monitor/usage/quota/limit.
  *
  * Platform is auto-detected from where the API key was found:
- * - "zai-coding-plan" entry or ZAI_API_KEY        -> https://api.z.ai
- * - "zhipu-coding-plan" entry or ZHIPU_API_KEY    -> https://bigmodel.cn
+ * - "zai-coding-plan" credential or ZAI_API_KEY        -> https://api.z.ai
+ * - "zhipu*-coding-plan" credential or ZHIPU_API_KEY   -> https://bigmodel.cn
  *
  * NOTE: the Authorization header carries the raw key, WITHOUT a "Bearer" prefix.
  */
 
-import { opencodeAuthEntry } from "./auth";
-import { clampPct, fetchJson, toIso } from "./http";
+import { credentialKey, credentialsFor, legacyAuthEntry } from "./auth";
+import { clampPct, describe, fetchJson, rateLimitedUntil, toIso } from "./http";
 import { errorResult, missingResult, type QuotaResult, type UsageWindow } from "./types";
-import { describe } from "./codex";
 
 const ZAI_BASE = "https://api.z.ai";
 const ZHIPU_BASE = "https://bigmodel.cn";
@@ -37,7 +36,7 @@ function unitLabel(unit: unknown): string | undefined {
   return undefined;
 }
 
-function parseWindows(body: QuotaResponse, platform: "zai" | "zhipu"): UsageWindow[] {
+export function parseWindows(body: QuotaResponse, platform: "zai" | "zhipu"): UsageWindow[] {
   if (
     platform === "zai" &&
     (body.success === false || (typeof body.code === "number" && body.code >= 400))
@@ -62,24 +61,27 @@ function parseWindows(body: QuotaResponse, platform: "zai" | "zhipu"): UsageWind
   return windows;
 }
 
+const GLM_IDS = ["zai-coding-plan", "zhipu-coding-plan", "zhipuai-coding-plan"] as const;
+
+function platformAuth(apiKey: string, platform: "zai" | "zhipu") {
+  return { apiKey, base: platform === "zai" ? ZAI_BASE : ZHIPU_BASE, platform };
+}
+
 export async function resolveGlmAuth(): Promise<
   { apiKey: string; base: string; platform: "zai" | "zhipu" } | undefined
 > {
-  const entry = await opencodeAuthEntry(["zai-coding-plan", "zhipu-coding-plan", "zhipuai-coding-plan"]);
-  if (entry) {
-    const apiKey = entry.entry.key?.trim() || entry.entry.access?.trim();
-    if (apiKey) {
-      const platform = entry.id === "zai-coding-plan" ? "zai" : "zhipu";
-      return { apiKey, base: platform === "zai" ? ZAI_BASE : ZHIPU_BASE, platform };
-    }
+  for (const id of GLM_IDS) {
+    const credential = (await credentialsFor([id]))[0];
+    const apiKey = credential ? credentialKey(credential) : (await legacyAuthEntry([id]))?.entry.key?.trim();
+    if (apiKey) return platformAuth(apiKey, id === "zai-coding-plan" ? "zai" : "zhipu");
   }
 
   const zaiEnv = process.env["ZAI_API_KEY"]?.trim() || process.env["ZAI_CODING_PLAN_API_KEY"]?.trim();
-  if (zaiEnv) return { apiKey: zaiEnv, base: ZAI_BASE, platform: "zai" };
+  if (zaiEnv) return platformAuth(zaiEnv, "zai");
 
   const zhipuEnv =
     process.env["ZHIPU_API_KEY"]?.trim() || process.env["ZHIPU_CODING_PLAN_API_KEY"]?.trim();
-  if (zhipuEnv) return { apiKey: zhipuEnv, base: ZHIPU_BASE, platform: "zhipu" };
+  if (zhipuEnv) return platformAuth(zhipuEnv, "zhipu");
 
   return undefined;
 }
@@ -104,6 +106,8 @@ export async function queryGlm(): Promise<QuotaResult> {
     if (windows.length === 0) return errorResult("No quota windows in GLM usage response.");
     return { ok: true, windows };
   } catch (error) {
+    const limitedUntil = rateLimitedUntil(error);
+    if (limitedUntil) return errorResult("GLM: rate limited (HTTP 429).", limitedUntil);
     return errorResult(describe(error, "GLM"));
   }
 }
