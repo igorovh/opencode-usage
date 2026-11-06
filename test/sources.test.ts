@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { maskEmail, parseWindows as parseClaude } from "../src/sources/claude";
 import { parseWindows as parseCodex } from "../src/sources/codex";
 import { parseWindows as parseGlm } from "../src/sources/glm";
@@ -77,5 +79,18 @@ describe("rate limits", () => {
     expect(rateLimitedUntil(new HttpError(429, "u", 30_000), now)).toBe(31_000);
     expect(rateLimitedUntil(new HttpError(429, "u"), now)).toBe(now + 5 * 60_000);
     expect(rateLimitedUntil(new HttpError(500, "u"), now)).toBeUndefined();
+  });
+});
+
+describe("fixture", () => {
+  test("turns relative resets into timestamps and reports absent providers as missing", async () => {
+    const { queryFixture } = await import("../src/fixture");
+    const path = new URL("../docs/demo-fixture.json", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+    const claude = await queryFixture(path, "claude");
+    expect(claude.ok && claude.accounts?.length).toBe(2);
+    expect(claude.ok && Date.parse(claude.windows[0]!.resetsAt!) > Date.now()).toBe(true);
+    const tmp = join(tmpdir(), `usage-fixture-${process.pid}.json`);
+    await Bun.write(tmp, "{}");
+    expect((await queryFixture(tmp, "glm")).ok).toBe(false);
   });
 });

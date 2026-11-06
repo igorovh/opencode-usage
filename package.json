@@ -23,8 +23,7 @@
     "compile": "bun scripts/compile.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "check:usage": "bun scripts/check.ts",
-    "demo": "bun --preload @opentui/solid/preload scripts/demo.tsx"
+    "check:usage": "bun scripts/check.ts"
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.2.5",
@@ -51,7 +50,6 @@
     "@opencode/theme": "2.2.5",
     "@opentui/core": "0.8.2",
     "@opentui/solid": "0.8.2",
-    "@resvg/resvg-js": "^2.6.2",
     "@types/bun": "1.4.4",
     "solid-js": "1.9.18",
     "typescript": "5.9.3"

@@ -1,0 +1,35 @@
+{
+  "codex": {
+    "plan": "Plus",
+    "windows": [
+      { "label": "5h", "usedPct": 18, "resetsInMin": 134 },
+      { "label": "7d", "usedPct": 46, "resetsInMin": 5400 }
+    ]
+  },
+  "claude": {
+    "windows": [
+      { "label": "5h", "usedPct": 36, "resetsInMin": 157 },
+      { "label": "7d", "usedPct": 62, "resetsInMin": 6960 }
+    ],
+    "accounts": [
+      { "label": "jo***@example.com", "active": true, "windows": [
+        { "label": "5h", "usedPct": 36, "resetsInMin": 157 },
+        { "label": "7d", "usedPct": 62, "resetsInMin": 6960 }
+      ] },
+      { "label": "an***@example.org", "windows": [
+        { "label": "5h", "usedPct": 85, "resetsInMin": 41 },
+        { "label": "7d", "usedPct": 23, "resetsInMin": 8760 }
+      ] }
+    ]
+  },
+  "glm": {
+    "windows": [{ "label": "5h", "usedPct": 55, "resetsInMin": 186 }]
+  },
+  "opencode-go": {
+    "windows": [
+      { "label": "5h", "usedPct": 4, "resetsInMin": 240 },
+      { "label": "7d", "usedPct": 31, "resetsInMin": 7200 },
+      { "label": "1m", "usedPct": 74, "resetsInMin": 27360 }
+    ]
+  }
+}

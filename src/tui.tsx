@@ -15,6 +15,7 @@
 import { Plugin, usePlugin } from "@opencode/plugin/tui";
 import { For, Show } from "solid-js";
 import { formatReset, renderBar, shortStatus } from "./format";
+import { fixturePath, queryFixture } from "./fixture";
 import { PROVIDER_IDS, parseOptions, type UsageOptions } from "./options";
 import { setCredentialLister, type StoredCredential } from "./sources/auth";
 import { writeUsageLog, setUsageLog } from "./sources/log";
@@ -454,7 +455,8 @@ export default Plugin.define({
             return;
           }
           const t0 = Date.now();
-          const result = await PROVIDERS[id]!.query(options);
+          const fixture = fixturePath();
+          const result = fixture ? await queryFixture(fixture, id) : await PROVIDERS[id]!.query(options);
           const ms = Date.now() - t0;
           void writeUsageLog({
             event: "refresh",
@@ -588,6 +590,3 @@ export default Plugin.define({
     };
   },
 });
-
-/** Rendered by scripts/demo.tsx for the README screenshot. */
-export { SidebarCard, StatusLine, type UsageState };
