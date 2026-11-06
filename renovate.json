@@ -1,23 +1,31 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "dependencyDashboard": true,
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": true,
+  "rebaseWhen": "behind-base-branch",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true,
+    "schedule": ["before 6am on monday"]
+  },
   "packageRules": [
     {
-      "description": "Host modules must match the OpenCode release, not the newest npm version",
+      "description": "Every update merges itself once the required CI check is green, majors included",
+      "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "Modules the OpenCode host provides move together",
       "matchPackageNames": ["@opencode/**", "@opentui/**", "solid-js"],
-      "groupName": "OpenCode host modules",
-      "dependencyDashboardApproval": true
+      "groupName": "OpenCode host modules"
     },
     {
       "description": "Peer ranges set the minimum supported OpenCode and are changed by hand",
       "matchDepTypes": ["peerDependencies"],
       "enabled": false
-    },
-    {
-      "matchDepTypes": ["devDependencies"],
-      "matchUpdateTypes": ["minor", "patch"],
-      "matchPackageNames": ["!@opencode/**", "!@opentui/**", "!solid-js"],
-      "automerge": true
     }
   ]
 }
