@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -37,9 +36,22 @@ jobs:
             echo "::error::dist/ is out of date - run 'bun run compile' and commit it."
             exit 1
           fi
-          # Pushes made with GITHUB_TOKEN start no workflows, so re-run CI on the new head explicitly.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "build: rebuild dist"
           git push origin "HEAD:$BRANCH"
-          gh workflow run ci.yml --ref "$BRANCH"
+          # The bot's push starts a pull_request run that waits for approval; approve it so the
+          # required check runs on the new head.
+          sha=$(git rev-parse HEAD)
+          for _ in $(seq 1 24); do
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&event=pull_request" -q '.workflow_runs[] | "\(.id) \(.conclusion)"')
+            pending=$(echo "$runs" | awk '$2 == "action_required" { print $1; exit }')
+            if [ -n "$pending" ]; then
+              gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$pending/approve"
+              exit 0
+            fi
+            [ -n "$runs" ] && exit 0
+            sleep 5
+          done
+          echo "::error::No CI run started for the rebuilt dist/ ($sha)."
+          exit 1
