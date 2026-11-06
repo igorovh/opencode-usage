@@ -41,8 +41,8 @@ export function shortStatus(message: string | undefined): string {
     const wait = message.match(/retry in (\d+[ms])/i)?.[1];
     return wait ? `rate limited (${wait})` : "rate limited";
   }
-  if (/HTTP 40[13]|unauthorized|expired/i.test(message)) return "login required";
-  if (/no subscription|entitlement|HTTP 403/i.test(message)) return "no subscription";
+  if (/no subscription|entitlement|forbidden|HTTP 403/i.test(message)) return "no subscription";
+  if (/HTTP 401|unauthorized|expired/i.test(message)) return "login required";
   if (/timed out|timeout/i.test(message)) return "timeout";
   if (/No .* token|connect|env/i.test(message)) return "not connected";
   return truncate(message, 24);

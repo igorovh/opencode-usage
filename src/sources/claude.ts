@@ -1,9 +1,8 @@
 /**
  * Claude usage for every Claude account connected in OpenCode.
  *
- * Accounts live in the OpenCode credential store (opencode.db, table
- * "credential", integration id "anthropic") and their OAuth rotation is owned
- * by the anthropic auth plugin (ex-machina). A connected Claude Agent
+ * Accounts live in the OpenCode credential store (integration id "anthropic",
+ * added by an Anthropic auth plugin that also owns OAuth rotation). A connected Claude Agent
  * (integration id "claude-agent") replaces them with the Claude Code login the
  * Agent SDK uses. This source only reads the current snapshot. On a 401 it
  * re-reads the store once (the token may have been rotated mid-query) and retries.
@@ -13,7 +12,7 @@
  * last good data.
  */
 
-import { clampPct, fetchJson, HttpError } from "./http";
+import { clampPct, describe, fetchJson, formatWait, HttpError } from "./http";
 import { readOpencodeClaudeAccounts, type OpencodeClaudeAccount } from "./auth";
 import {
   errorResult,
@@ -22,18 +21,22 @@ import {
   type QuotaResult,
   type UsageWindow,
 } from "./types";
-import { describe } from "./codex";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const BETA_HEADER = "oauth-2025-04-20";
-// The endpoint throttles unknown user agents - identify as the official client.
-const USER_AGENT = "claude-code/2.1.0";
+// The endpoint throttles unknown user agents, so the default mimics Claude Code (option `claudeUserAgent`).
+export const DEFAULT_CLAUDE_USER_AGENT = "claude-code/2.1.0";
+let userAgent = DEFAULT_CLAUDE_USER_AGENT;
+
+export function setClaudeUserAgent(value: string | undefined): void {
+  userAgent = value?.trim() || DEFAULT_CLAUDE_USER_AGENT;
+}
 const RATE_LIMIT_BACKOFF_BASE_MS = 30_000;
 const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000;
 /** Minimum gap between HTTP usage calls for one account (matches the refresh cadence). */
 const HTTP_MIN_INTERVAL_MS = 60_000;
 
-/** an***@example.org - local part clipped, domain kept. */
+/** jo***@example.com - local part clipped, domain kept. */
 export function maskEmail(email: string): string {
   const at = email.indexOf("@");
   if (at <= 0) return "***";
@@ -105,7 +108,7 @@ function parseWindow(
   };
 }
 
-function parseWindows(data: AnthropicUsageResponse): UsageWindow[] {
+export function parseWindows(data: AnthropicUsageResponse): UsageWindow[] {
   const windows: UsageWindow[] = [];
   const fiveHour = parseWindow(data.five_hour, "5h");
   const sevenDay = parseWindow(data.seven_day ?? data.seven_day_oauth_apps, "7d");
@@ -119,7 +122,7 @@ async function fetchUsage(token: string): Promise<UsageWindow[]> {
     headers: {
       authorization: `Bearer ${token}`,
       "anthropic-beta": BETA_HEADER,
-      "user-agent": USER_AGENT,
+      "user-agent": userAgent,
     },
   });
   const windows = parseWindows(data);
@@ -230,7 +233,7 @@ async function queryClaudeAccount(
           runtime.rateLimitedUntil,
         );
       }
-      const wait = waitMs >= 60_000 ? `${Math.round(waitMs / 60_000)}m` : `${Math.round(waitMs / 1000)}s`;
+      const wait = formatWait(waitMs);
       return outcome(
         account,
         label,
@@ -290,7 +293,7 @@ export async function queryClaude(): Promise<QuotaResult> {
   }
 
   const firstError = outcomes.find((outcome) => outcome.kind === "error");
-  if (firstError?.message) return errorResult(firstError.message);
+  if (firstError?.message) return errorResult(firstError.message, firstError.limitedUntil);
   return missingResult(
     outcomes[0]?.message ?? "No Claude account connected in OpenCode - connect one via /connect.",
   );
