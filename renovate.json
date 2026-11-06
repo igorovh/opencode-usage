@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "Host modules must match the OpenCode release, not the newest npm version",
+      "matchPackageNames": ["@opencode/**", "@opentui/**", "solid-js"],
+      "groupName": "OpenCode host modules",
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Peer ranges set the minimum supported OpenCode and are changed by hand",
+      "matchDepTypes": ["peerDependencies"],
+      "enabled": false
+    },
+    {
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchPackageNames": ["!@opencode/**", "!@opentui/**", "!solid-js"],
+      "automerge": true
+    }
+  ]
+}
