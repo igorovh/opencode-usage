@@ -7,8 +7,11 @@ footer and on the home screen, and a `/usage` command.
 > Supports OpenCode V2 only, 2.2.5 or newer. V1 is not supported.
 
 <p align="center">
-  <img src="docs/demo.png" alt="Usage card in the OpenCode sidebar with Codex, Claude (two accounts), GLM and OpenCode Go" width="520">
+  <img src="docs/demo.gif" alt="Usage line in the footer, the /usage toast and the usage card in the session sidebar" width="1000">
 </p>
+
+The demo shows, in order: the usage line in the footer, `/usage` with its summary toast, and the sidebar card
+with two Claude accounts once a session is open. All numbers are made up.
 
 ## Features
 
@@ -135,6 +138,10 @@ folder loads `tui.ts` straight from `src/`, and OpenCode reloads it when a file 
 ```
 
 Run `bun run compile` before you commit a change to `src/`; CI fails when `dist/` is out of date.
+
+The README demo is recorded with [VHS](https://github.com/charmbracelet/vhs): `vhs docs/demo.tape`. It runs
+OpenCode in a throwaway profile, and `OPENCODE_USAGE_FIXTURE` points the plugin at `docs/demo-fixture.json`
+instead of the real APIs.
 
 ## Credits
 

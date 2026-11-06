@@ -57,6 +57,32 @@ function shortStatus(message) {
   return truncate(message, 24);
 }
 
+// src/fixture.ts
+import { readFile } from "fs/promises";
+function fixturePath() {
+  return process.env["OPENCODE_USAGE_FIXTURE"]?.trim() || undefined;
+}
+function toWindows(windows, now) {
+  return windows.map((window) => ({
+    label: window.label,
+    usedPct: window.usedPct,
+    resetsAt: window.resetsInMin === undefined ? undefined : new Date(now + window.resetsInMin * 60000).toISOString()
+  }));
+}
+async function queryFixture(path, id) {
+  const fixture = JSON.parse(await readFile(path, "utf8"));
+  const provider = fixture[id];
+  if (!provider)
+    return { ok: false, kind: "missing", message: "Not in the fixture." };
+  const now = Date.now();
+  const accounts = provider.accounts?.map((account) => ({
+    label: account.label,
+    active: account.active ?? false,
+    windows: toWindows(account.windows, now)
+  }));
+  return { ok: true, plan: provider.plan, windows: toWindows(provider.windows, now), accounts };
+}
+
 // src/options.ts
 var PROVIDER_IDS = ["codex", "claude", "glm", "opencode-go"];
 var DEFAULT_REFRESH_MS = 60000;
@@ -87,7 +113,7 @@ function parseOptions(raw) {
 // src/sources/auth.ts
 import { execFile } from "child_process";
 import { createHash } from "crypto";
-import { readFile } from "fs/promises";
+import { readFile as readFile2 } from "fs/promises";
 import { existsSync } from "fs";
 import { homedir, userInfo } from "os";
 import { join } from "path";
@@ -198,7 +224,7 @@ async function readLegacyAuth() {
     return legacyAuthCache.value;
   let value = null;
   try {
-    value = asRecord(JSON.parse(await readFile(join(opencodeDataDir(), "auth.json"), "utf8"))) ?? null;
+    value = asRecord(JSON.parse(await readFile2(join(opencodeDataDir(), "auth.json"), "utf8"))) ?? null;
   } catch {}
   legacyAuthCache = { at: now, value };
   return value;
@@ -240,7 +266,7 @@ async function readClaudeCodeLogin() {
   if (process.platform === "darwin")
     candidates.push(() => readKeychainSecret(claudeKeychainService()));
   const file = join(claudeConfigDir() ?? join(homedir(), ".claude"), ".credentials.json");
-  candidates.push(() => readFile(file, "utf8").catch(() => {
+  candidates.push(() => readFile2(file, "utf8").catch(() => {
     return;
   }));
   for (const read of candidates) {
@@ -258,7 +284,7 @@ async function readClaudeCodeLogin() {
 async function readClaudeCodeEmail() {
   const file = join(claudeConfigDir() ?? homedir(), ".claude.json");
   try {
-    const parsed = asRecord(JSON.parse(await readFile(file, "utf8")));
+    const parsed = asRecord(JSON.parse(await readFile2(file, "utf8")));
     return firstString(asRecord(parsed?.["oauthAccount"]), ["emailAddress"]);
   } catch {
     return;
@@ -313,7 +339,7 @@ async function readOpencodeClaudeAccounts(force = false) {
 async function codexCliTokens() {
   const codexHome = process.env["CODEX_HOME"]?.trim() || join(homedir(), ".codex");
   try {
-    const content = await readFile(join(codexHome, "auth.json"), "utf8");
+    const content = await readFile2(join(codexHome, "auth.json"), "utf8");
     const tokens = asRecord(asRecord(JSON.parse(content))?.["tokens"]);
     const accessToken = firstString(tokens, ["access_token"]);
     if (!accessToken)
@@ -1319,7 +1345,8 @@ var tui_default = Plugin.define({
           return;
         }
         const t0 = Date.now();
-        const result = await PROVIDERS[id].query(options);
+        const fixture = fixturePath();
+        const result = fixture ? await queryFixture(fixture, id) : await PROVIDERS[id].query(options);
         const ms = Date.now() - t0;
         writeUsageLog({
           event: "refresh",
@@ -1455,7 +1482,5 @@ var tui_default = Plugin.define({
   }
 });
 export {
-  SidebarCard,
-  StatusLine,
   tui_default as default
 };
