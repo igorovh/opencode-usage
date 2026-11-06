@@ -103,7 +103,7 @@ export async function queryGlm(): Promise<QuotaResult> {
       },
     });
     const windows = parseWindows(body, auth.platform);
-    if (windows.length === 0) return errorResult("No quota windows in GLM usage response.");
+    if (windows.length === 0) return errorResult("GLM: no quota windows in the usage response.");
     return { ok: true, windows };
   } catch (error) {
     const limitedUntil = rateLimitedUntil(error);
