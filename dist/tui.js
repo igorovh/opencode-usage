@@ -814,7 +814,7 @@ async function queryGlm() {
     });
     const windows = parseWindows3(body, auth.platform);
     if (windows.length === 0)
-      return errorResult("No quota windows in GLM usage response.");
+      return errorResult("GLM: no quota windows in the usage response.");
     return { ok: true, windows };
   } catch (error) {
     const limitedUntil = rateLimitedUntil(error);
