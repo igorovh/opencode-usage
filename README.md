@@ -44,7 +44,7 @@ Install the plugin from GitHub with the OpenCode CLI. Pin a release tag, so the 
 `opencode plugin update` can tell when a new version is out:
 
 ```sh
-opencode plugin add github:igorovh/opencode-usage#v0.2.0
+opencode plugin add github:igorovh/opencode-usage#v0.3.0
 ```
 
 This adds the plugin to the `plugins` array in `~/.config/opencode/cli.json`. Restart the TUI and the card
@@ -72,7 +72,7 @@ the TUI.
 {
   "plugins": [
     {
-      "package": "github:igorovh/opencode-usage#v0.2.0",
+      "package": "github:igorovh/opencode-usage#v0.3.0",
       "options": {
         "providers": { "glm": false, "opencode-go": false },
         "footer": false
