@@ -24,7 +24,7 @@ export default defineRecorder({
   },
   steps: {
     fixture: {
-      usage: 'fixture <json>            replace providers in the made-up usage, such as {"glm":null}; /usage shows it',
+      usage: 'fixture <json>            replace providers in the made-up usage, such as {"glm":null}; "Refresh usage" in the palette shows it',
       run: async (ctx) => {
         const current = JSON.parse(readFileSync(fixture, "utf8")) as Record<string, unknown>;
         writeFileSync(fixture, JSON.stringify({ ...current, ...(JSON.parse(ctx.arg) as Record<string, unknown>) }));
