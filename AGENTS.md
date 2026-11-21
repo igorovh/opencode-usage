@@ -15,8 +15,9 @@
 - `fixture <json>` replaces whole providers in that copy, for example
   `fixture {"codex":{"windows":[{"label":"5h","usedPct":95,"resetsInMin":30}]}}`, and `"glm":null` hides GLM.
   The plugin reads it on the next refresh, so run "Refresh usage" after it.
-- Run the command from the palette (`key ctrl+p`, `type Refresh usage`, `key Enter`). On OpenCode 2.3.2, `/usage` and
-  Enter open OpenCode's own usage dialog instead of the plugin's toast.
+- Run the command from the palette (`key ctrl+p`, `type Refresh usage`, `key Enter`) or type
+  `/refresh-usage`. On OpenCode 2.3.2 and newer, `/usage` opens OpenCode's own usage dialog instead of
+  the plugin's toast (the plugin keeps `/usage` as an alias for older versions).
 - `--options '{"footer":false}'` passes plugin options and `--plugin <path>` records another checkout, such as a
   worktree of the base branch.
 - `expect <text>` and `expect-not <text>` steps fail the recording when the screen does not match, so a GIF

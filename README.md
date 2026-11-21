@@ -2,15 +2,15 @@
 
 A plugin for the [OpenCode](https://opencode.ai) TUI (v2) that shows how much of your **Codex**, **Claude**,
 **GLM Coding Plan** and **OpenCode Go** quota is left: a card in the session sidebar, a one-liner in the prompt
-footer and on the home screen, and a `/usage` command.
+footer and on the home screen, and a `/refresh-usage` command.
 
 > Supports OpenCode V2 only, 2.2.5 or newer. V1 is not supported.
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Usage line in the footer, the /usage toast and the usage card in the session sidebar" width="1000">
+  <img src="docs/demo.gif" alt="Usage line in the footer, the /refresh-usage toast and the usage card in the session sidebar" width="1000">
 </p>
 
-The demo shows, in order: the usage line in the footer, `/usage` with its summary toast, and the sidebar card
+The demo shows, in order: the usage line in the footer, `/refresh-usage` with its summary toast, and the sidebar card
 with two Claude accounts once a session is open. All numbers are made up.
 
 ## Features
@@ -18,7 +18,9 @@ with two Claude accounts once a session is open. All numbers are made up.
 - **Sidebar card** with a bar per quota window (`5h`, `7d`, `1m`), the percentage **remaining** and the time
   until it resets. Bars turn yellow at 50% and red at 20% remaining.
 - **Prompt footer and home screen line** with the 5-hour window of every provider, e.g. `Codex 82% / Claude 64%`.
-- **`/usage`** (slash command and palette) refreshes everything and shows a summary toast.
+- **`/refresh-usage`** (slash command and palette) refreshes everything and shows a summary toast.
+  On OpenCode 2.3.2 and newer, `/usage` opens the built-in Usage dialog, so the plugin uses
+  `/refresh-usage` instead. `/usage` still works as an alias on older versions.
 - **Several Claude accounts.** Every Claude account connected in OpenCode gets its own rows and a masked email.
   With the Claude Agent integration connected, the plugin shows the Claude Code login instead.
 - **Only what you use.** Providers without credentials are hidden; you can switch off the rest in the options.

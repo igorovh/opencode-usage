@@ -1013,7 +1013,8 @@ function UsageCommands(props) {
       group: "Usage",
       palette: true,
       slash: {
-        name: "usage"
+        name: "refresh-usage",
+        aliases: ["usage"]
       },
       suggested: true,
       run: async () => {
