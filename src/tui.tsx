@@ -7,7 +7,8 @@
  * - a one-liner on the home screen (slot "home.footer")
  *
  * Data is refreshed on an interval (default 60s), when a session execution
- * finishes, and on demand via the /usage slash command.
+ * finishes, and on demand via the /refresh-usage slash command
+ * (/usage stays as an alias for OpenCode versions without a built-in /usage).
  */
 
 /** @jsxImportSource @opentui/solid */
@@ -150,7 +151,8 @@ function summary(snapshot: ProviderSnapshot): string {
 // Components
 // ---------------------------------------------------------------------------
 
-/** Mounts the /usage command. Keymap layers must be created inside a rendered component. */
+/** Mounts the refresh command (/refresh-usage, alias /usage).
+ * Keymap layers must be created inside a rendered component. */
 function UsageCommands(props: {
   ctx: TuiContext;
   refresh: (opts?: { force?: boolean }) => Promise<void>;
@@ -165,7 +167,10 @@ function UsageCommands(props: {
         title: "Refresh usage",
         group: "Usage",
         palette: true,
-        slash: { name: "usage" },
+        // OpenCode 2.3 added a built-in /usage dialog that wins over a plugin
+        // command with the same name, so the plugin answers to /refresh-usage.
+        // /usage stays as an alias for older versions without the built-in.
+        slash: { name: "refresh-usage", aliases: ["usage"] },
         suggested: true,
         run: async () => {
           await props.refresh({ force: true });
@@ -443,7 +448,7 @@ export default Plugin.define({
             return;
           }
           // Claude: the timer tick is a no-op while the persisted cache
-          // window (idle ramp, 2..15 min) is fresh; turns and /usage force.
+          // window (idle ramp, 2..15 min) is fresh; turns and /refresh-usage force.
           if (id === "claude" && !opts?.force && (before.cacheUntil ?? 0) > now0) {
             void writeUsageLog({
               event: "skip",
