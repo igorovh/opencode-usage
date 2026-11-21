@@ -141,7 +141,8 @@ Run `bun run compile` before you commit a change to `src/`; CI fails when `dist/
 
 The README demo is recorded with [VHS](https://github.com/charmbracelet/vhs): `vhs docs/demo.tape`. It runs
 OpenCode in a throwaway profile, and `OPENCODE_USAGE_FIXTURE` points the plugin at `docs/demo-fixture.json`
-instead of the real APIs.
+instead of the real APIs. `bun run record` records the same made-up usage with
+[opencode-tui-recorder](https://github.com/igorovh/opencode-tui-recorder); see "Demo recordings" in `AGENTS.md`.
 
 ## Credits
 
